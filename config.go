@@ -443,6 +443,7 @@ func loadConfig() (*config, []string, error) {
 		Generate:             defaultGenerate,
 		TxIndex:              defaultTxIndex,
 		AddrIndex:            defaultAddrIndex,
+		Prune:                0, // Default: disable pruning (do not delete blocks)
 		V2Transport:          false,
 	}
 

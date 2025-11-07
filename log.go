@@ -131,20 +131,20 @@ func getLevelColor(level string) string {
 func (cw *colorizedWriter) colorizeMessage(message string) string {
 	result := message
 
-	// Colorize numbers in "Processed X blocks" pattern (light blue / cyan blue)
+	// Colorize numbers in "Processed X blocks" pattern (light orange / tangerine)
 	result = cw.processedPattern.ReplaceAllStringFunc(result, func(match string) string {
 		parts := cw.processedPattern.FindStringSubmatch(match)
 		if len(parts) == 4 {
-			return parts[1] + colorLightBlue + parts[2] + colorReset + parts[3]
+			return parts[1] + colorLightOrange + parts[2] + colorReset + parts[3]
 		}
 		return match
 	})
 
-	// Colorize numbers in "height X" pattern (light orange / tangerine)
+	// Colorize numbers in "height X" pattern (light blue / cyan blue)
 	result = cw.heightPattern.ReplaceAllStringFunc(result, func(match string) string {
 		parts := cw.heightPattern.FindStringSubmatch(match)
 		if len(parts) == 3 {
-			return parts[1] + colorLightOrange + parts[2] + colorReset
+			return parts[1] + colorLightBlue + parts[2] + colorReset
 		}
 		return match
 	})
