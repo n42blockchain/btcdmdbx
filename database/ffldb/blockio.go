@@ -466,10 +466,12 @@ func (s *blockStore) writeBlock(tx *transaction, blockHeight int32, rawBlock []b
 		wc.Unlock()
 
 		saveFirstBlockHeightInBlockFile(tx, wc.curFileNum, blockHeight)
-		if wc.curFileNum >= maxLocalBlockFilesCount {
-			fileNumToBeDelete := wc.curFileNum - maxLocalBlockFilesCount
-			s.cleanOutdatedData(tx, fileNumToBeDelete)
-		}
+		// Disable automatic file deletion based on file count.
+		// Files will only be deleted if prune is explicitly enabled via --prune parameter.
+		// if wc.curFileNum >= maxLocalBlockFilesCount {
+		// 	fileNumToBeDelete := wc.curFileNum - maxLocalBlockFilesCount
+		// 	s.cleanOutdatedData(tx, fileNumToBeDelete)
+		// }
 	}
 	if blockHeight == 0 {
 		// special case for genesis block

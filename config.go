@@ -524,6 +524,28 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
+	// Check if --prune was explicitly set via command line
+	// This checks for --prune=value, --prune value, or -prune=value formats
+	pruneExplicitlySet := false
+	for _, arg := range os.Args[1:] {
+		// Check for --prune=value or -prune=value format
+		if strings.HasPrefix(arg, "--prune=") || strings.HasPrefix(arg, "-prune=") {
+			pruneExplicitlySet = true
+			break
+		}
+		// Check for --prune or -prune (may be followed by value in next arg)
+		if arg == "--prune" || arg == "-prune" {
+			pruneExplicitlySet = true
+			break
+		}
+	}
+
+	// If prune was not explicitly set via command line, force it to 0 (disable)
+	// This ensures that prune is disabled by default, even if set in config file
+	if !pruneExplicitlySet {
+		cfg.Prune = 0
+	}
+
 	// Create the home directory if it doesn't already exist.
 	funcName := "loadConfig"
 	err = os.MkdirAll(defaultHomeDir, 0700)

@@ -77,16 +77,18 @@ const (
 	colorBrightOrange  = "\033[38;5;214m" // Bright Orange (256-color mode)
 	colorLightBlue     = "\033[38;5;117m" // Light Blue / Cyan Blue (256-color mode)
 	colorLightOrange   = "\033[38;5;215m" // Light Orange / Tangerine (256-color mode)
+	colorLightMagenta  = "\033[38;5;213m" // Light Purple / Pink Purple (256-color mode)
 )
 
 // colorizedWriter implements an io.Writer that adds colors to log output
 // and writes to both standard output and the log rotator.
 type colorizedWriter struct {
-	buffer           []byte
-	plainBuf         bytes.Buffer
-	logPattern       *regexp.Regexp
-	processedPattern *regexp.Regexp
-	heightPattern    *regexp.Regexp
+	buffer              []byte
+	plainBuf            bytes.Buffer
+	logPattern          *regexp.Regexp
+	processedPattern    *regexp.Regexp
+	heightPattern       *regexp.Regexp
+	transactionsPattern *regexp.Regexp
 }
 
 // newColorizedWriter creates a new colorized writer
@@ -98,11 +100,14 @@ func newColorizedWriter() *colorizedWriter {
 	processedPattern := regexp.MustCompile(`(?i)(Processed\s+)(\d+)(\s+blocks)`)
 	// Pattern to match "height X" - capture the number (case-insensitive)
 	heightPattern := regexp.MustCompile(`(?i)(height\s+)(\d+)`)
+	// Pattern to match "X transactions," - capture the number (case-insensitive)
+	transactionsPattern := regexp.MustCompile(`(?i)(\d+)(\s+transactions,?)`)
 	return &colorizedWriter{
-		buffer:           make([]byte, 0, 4096),
-		logPattern:       pattern,
-		processedPattern: processedPattern,
-		heightPattern:    heightPattern,
+		buffer:              make([]byte, 0, 4096),
+		logPattern:          pattern,
+		processedPattern:    processedPattern,
+		heightPattern:       heightPattern,
+		transactionsPattern: transactionsPattern,
 	}
 }
 
@@ -145,6 +150,15 @@ func (cw *colorizedWriter) colorizeMessage(message string) string {
 		parts := cw.heightPattern.FindStringSubmatch(match)
 		if len(parts) == 3 {
 			return parts[1] + colorLightBlue + parts[2] + colorReset
+		}
+		return match
+	})
+
+	// Colorize numbers in "X transactions," pattern (light purple / pink purple)
+	result = cw.transactionsPattern.ReplaceAllStringFunc(result, func(match string) string {
+		parts := cw.transactionsPattern.FindStringSubmatch(match)
+		if len(parts) == 3 {
+			return colorLightMagenta + parts[1] + colorReset + parts[2]
 		}
 		return match
 	})

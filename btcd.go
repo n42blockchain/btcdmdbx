@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"runtime/pprof"
 	"runtime/trace"
+	"strings"
 
 	"github.com/btcsuite/btcd/blockchain/indexers"
 	"github.com/btcsuite/btcd/database"
@@ -181,12 +182,32 @@ func btcdMain(serverChan chan<- *server) error {
 		btcdLog.Errorf("%v", err)
 		return err
 	}
-	if beenPruned && cfg.Prune == 0 {
+	// Allow disabling prune even if database was previously pruned,
+	// as long as user hasn't explicitly set --prune (default behavior is to disable)
+	// Check if --prune was explicitly set via command line
+	pruneExplicitlySet := false
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "--prune=") || strings.HasPrefix(arg, "-prune=") {
+			pruneExplicitlySet = true
+			break
+		}
+		if arg == "--prune" || arg == "-prune" {
+			pruneExplicitlySet = true
+			break
+		}
+	}
+	// Only enforce the restriction if prune was explicitly set
+	if beenPruned && cfg.Prune == 0 && pruneExplicitlySet {
 		err = fmt.Errorf("--prune cannot be disabled as the node has been "+
 			"previously pruned. You must delete the files in the datadir: \"%s\" "+
 			"and sync from the beginning to disable pruning", cfg.DataDir)
 		btcdLog.Errorf("%v", err)
 		return err
+	}
+	// If prune is disabled by default (not explicitly set), allow it even if beenPruned
+	if beenPruned && cfg.Prune == 0 && !pruneExplicitlySet {
+		btcdLog.Infof("Database was previously pruned, but prune is now disabled by default. " +
+			"No further blocks will be deleted.")
 	}
 	if beenPruned && cfg.TxIndex {
 		err = fmt.Errorf("--txindex cannot be enabled as the node has been "+
@@ -230,26 +251,29 @@ func btcdMain(serverChan chan<- *server) error {
 		return err
 	}
 
-	// Enforce removal of txindex and addrindex if user requested pruning.
-	// This is to require explicit action from the user before removing
-	// indexes that won't be useful when block files are pruned.
+	// Automatically drop txindex and addrindex if user requested pruning.
+	// These indexes won't be useful when block files are pruned, so we
+	// automatically remove them to allow pruning to proceed.
 	//
 	// NOTE: The order is important here because dropping the tx index also
-	// drops the address index since it relies on it.  We explicitly make the
-	// user drop both indexes if --addrindex was enabled previously.
+	// drops the address index since it relies on it.
 	if cfg.Prune != 0 && indexers.AddrIndexInitialized(db) {
-		err = fmt.Errorf("--prune flag may not be given when the address index " +
-			"has been initialized. Please drop the address index with the " +
-			"--dropaddrindex flag before enabling pruning")
-		btcdLog.Errorf("%v", err)
-		return err
+		btcdLog.Infof("Address index detected. Automatically dropping address index " +
+			"to allow pruning to proceed...")
+		if err := indexers.DropAddrIndex(db, interrupt); err != nil {
+			btcdLog.Errorf("Failed to drop address index: %v", err)
+			return err
+		}
+		btcdLog.Infof("Address index dropped successfully.")
 	}
 	if cfg.Prune != 0 && indexers.TxIndexInitialized(db) {
-		err = fmt.Errorf("--prune flag may not be given when the transaction index " +
-			"has been initialized. Please drop the transaction index with the " +
-			"--droptxindex flag before enabling pruning")
-		btcdLog.Errorf("%v", err)
-		return err
+		btcdLog.Infof("Transaction index detected. Automatically dropping transaction index " +
+			"to allow pruning to proceed...")
+		if err := indexers.DropTxIndex(db, interrupt); err != nil {
+			btcdLog.Errorf("Failed to drop transaction index: %v", err)
+			return err
+		}
+		btcdLog.Infof("Transaction index dropped successfully.")
 	}
 
 	// The config file is already created if it did not exist and the log
