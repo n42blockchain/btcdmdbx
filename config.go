@@ -151,6 +151,7 @@ type config struct {
 	ProxyPass            string        `long:"proxypass" default-mask:"-" description:"Password for proxy server"`
 	ProxyUser            string        `long:"proxyuser" description:"Username for proxy server"`
 	Prune                uint64        `long:"prune" description:"Prune already validated blocks from the database. Must specify a target size in MiB (minimum value of 1536, default value of 0 will disable pruning)"`
+	pruneSet             bool
 	RegressionTest       bool          `long:"regtest" description:"Use the regression test network"`
 	RejectNonStd         bool          `long:"rejectnonstd" description:"Reject non-standard transactions regardless of the default settings for the active network."`
 	RejectReplacement    bool          `long:"rejectreplacement" description:"Reject transactions that attempt to replace existing transactions within the mempool through the Replace-By-Fee (RBF) signaling policy."`
@@ -521,6 +522,14 @@ func loadConfig() (*config, []string, error) {
 			fmt.Fprintln(os.Stderr, usageMessage)
 		}
 		return nil, nil, err
+	}
+
+	// Use go-flags API to check if --prune was explicitly set on CLI.
+	// If not, force prune to 0 so config-file values don't enable it silently.
+	if opt := parser.FindOptionByLongName("prune"); opt != nil && opt.IsSet() {
+		cfg.pruneSet = true
+	} else {
+		cfg.Prune = 0
 	}
 
 	// Create the home directory if it doesn't already exist.
