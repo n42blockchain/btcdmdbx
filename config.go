@@ -534,8 +534,13 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	// Use go-flags API to check if --prune was explicitly set on CLI.
-	// If not, force prune to 0 so config-file values don't enable it silently.
+	// Record whether a prune target was configured at all. IsSet reports
+	// true for both the command line and the config file, so it does not
+	// distinguish the two sources; it only separates "the operator asked
+	// for pruning" from "prune was never mentioned". Only in the latter
+	// case is Prune forced to zero, which btcdMain treats as leaving a
+	// previously pruned database as-is rather than as an attempt to
+	// disable pruning.
 	if opt := parser.FindOptionByLongName("prune"); opt != nil && opt.IsSet() {
 		cfg.pruneSet = true
 	} else {
