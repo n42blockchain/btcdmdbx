@@ -10,6 +10,8 @@ The numbers quoted below are rBTC's measurements on its own storage layer,
 not btcd's; they are recorded to show what a decision backed by data looks
 like, not as predictions for this codebase.
 
+The concrete design these notes lead to is in `storage_design.md`.
+
 ## 1. One write transaction, or nothing
 
 This is the constraint everything else hangs off. rBTC's own MDBX backend
