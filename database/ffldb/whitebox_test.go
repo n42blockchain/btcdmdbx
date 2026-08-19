@@ -21,8 +21,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/syndtr/goleveldb/leveldb"
-	ldberrors "github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/cockroachdb/pebble"
 )
 
 var (
@@ -135,8 +134,8 @@ type testContext struct {
 	blocks       []*btcutil.Block
 }
 
-// TestConvertErr ensures the leveldb error to database error conversion works
-// as expected.
+// TestConvertErr ensures the storage engine error to database error
+// conversion works as expected.
 func TestConvertErr(t *testing.T) {
 	t.Parallel()
 
@@ -144,10 +143,14 @@ func TestConvertErr(t *testing.T) {
 		err         error
 		wantErrCode database.ErrorCode
 	}{
-		{&ldberrors.ErrCorrupted{}, database.ErrCorruption},
-		{leveldb.ErrClosed, database.ErrDbNotOpen},
-		{leveldb.ErrSnapshotReleased, database.ErrTxClosed},
-		{leveldb.ErrIterReleased, database.ErrTxClosed},
+		{pebble.ErrCorruption, database.ErrCorruption},
+		{pebble.ErrClosed, database.ErrDbNotOpen},
+
+		// The engine reports a closed store, a closed snapshot and a
+		// closed iterator with the same error, so a released snapshot no
+		// longer maps to ErrTxClosed the way it did before.
+		{fmt.Errorf("wrapped: %w", pebble.ErrCorruption),
+			database.ErrCorruption},
 	}
 
 	for i, test := range tests {
@@ -214,15 +217,15 @@ func TestCornerCases(t *testing.T) {
 	}
 	_ = os.RemoveAll(filePath)
 
-	// Close the underlying leveldb database out from under the database.
-	ldb := idb.(*db).cache.ldb
-	ldb.Close()
+	// Close the underlying metadata store out from under the database.
+	metaDB := idb.(*db).cache.metaDB
+	metaDB.Close()
 
 	// Ensure initialization errors in the underlying database work as
 	// expected.
 	testName = "initDB: reinitialization"
 	wantErrCode = database.ErrDbNotOpen
-	err = initDB(ldb)
+	err = initDB(metaDB)
 	if !checkDbError(t, testName, err, wantErrCode) {
 		return
 	}

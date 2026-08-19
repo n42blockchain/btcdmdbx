@@ -7,6 +7,7 @@ package ffldb
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,18 +20,19 @@ import (
 	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/database/internal/treap"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/comparer"
-	ldberrors "github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/filter"
-	"github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 )
 
 const (
 	// metadataDbName is the name used for the metadata database.
 	metadataDbName = "metadata"
+
+	// numMetadataLevels is how many LSM levels the metadata store is
+	// configured with.  Seven is the engine default; it is named here
+	// only because the per-level compression and filter settings have to
+	// be applied to each one explicitly.
+	numMetadataLevels = 7
 
 	// blockHdrSize is the size of a block header.  This is simply the
 	// constant from wire and is only provided here for convenience since
@@ -131,36 +133,36 @@ func makeDbErr(c database.ErrorCode, desc string, err error) database.Error {
 	return database.Error{ErrorCode: c, Description: desc, Err: err}
 }
 
-// convertErr converts the passed leveldb error into a database error with an
-// equivalent error code  and the passed description.  It also sets the passed
-// error as the underlying error.
-func convertErr(desc string, ldbErr error) database.Error {
+// convertErr converts the passed storage engine error into a database error
+// with an equivalent error code and the passed description.  It also sets the
+// passed error as the underlying error.
+func convertErr(desc string, engineErr error) database.Error {
 	// Use the driver-specific error code by default.  The code below will
 	// update this with the converted error if it's recognized.
 	var code = database.ErrDriverSpecific
 
 	switch {
 	// Database corruption errors.
-	case ldberrors.IsCorrupted(ldbErr):
+	case errors.Is(engineErr, pebble.ErrCorruption):
 		code = database.ErrCorruption
 
-	// Database open/create errors.
-	case ldbErr == leveldb.ErrClosed:
+	// Database open/create errors.  The engine reports use of a closed
+	// store, a closed snapshot, and a closed iterator all as ErrClosed,
+	// so unlike the previous engine they cannot be told apart here.
+	case errors.Is(engineErr, pebble.ErrClosed):
 		code = database.ErrDbNotOpen
-
-	// Transaction errors.
-	case ldbErr == leveldb.ErrSnapshotReleased:
-		code = database.ErrTxClosed
-	case ldbErr == leveldb.ErrIterReleased:
-		code = database.ErrTxClosed
 	}
 
-	return database.Error{ErrorCode: code, Description: desc, Err: ldbErr}
+	return database.Error{
+		ErrorCode:   code,
+		Description: desc,
+		Err:         engineErr,
+	}
 }
 
 // copySlice returns a copy of the passed slice.  This is mostly used to copy
-// leveldb iterator keys and values since they are only valid until the iterator
-// is moved instead of during the entirety of the transaction.
+// iterator keys and values since they are only valid until the iterator is
+// moved instead of during the entirety of the transaction.
 func copySlice(slice []byte) []byte {
 	ret := make([]byte, len(slice))
 	copy(ret, slice)
@@ -171,9 +173,9 @@ func copySlice(slice []byte) []byte {
 // and nested buckets of a bucket and implements the database.Cursor interface.
 type cursor struct {
 	bucket      *bucket
-	dbIter      iterator.Iterator
-	pendingIter iterator.Iterator
-	currentIter iterator.Iterator
+	dbIter      dbIterator
+	pendingIter dbIterator
+	currentIter dbIterator
 }
 
 // Enforce cursor implements the database.Cursor interface.
@@ -491,12 +493,12 @@ func cursorFinalizer(c *cursor) {
 // NOTE: The caller is responsible for calling the cursorFinalizer function on
 // the returned cursor.
 func newCursor(b *bucket, bucketID []byte, cursorTyp cursorType) *cursor {
-	var dbIter, pendingIter iterator.Iterator
+	var dbIter, pendingIter dbIterator
 	switch cursorTyp {
 	case ctKeys:
-		keyRange := util.BytesPrefix(bucketID)
-		dbIter = b.tx.snapshot.NewIterator(keyRange)
-		pendingKeyIter := newLdbTreapIter(b.tx, keyRange)
+		keyBounds := bytesPrefix(bucketID)
+		dbIter = b.tx.snapshot.NewIterator(keyBounds)
+		pendingKeyIter := newPendingTreapIter(b.tx, keyBounds)
 		pendingIter = pendingKeyIter
 
 	case ctBuckets:
@@ -509,10 +511,10 @@ func newCursor(b *bucket, bucketID []byte, cursorTyp cursorType) *cursor {
 		prefix := make([]byte, len(bucketIndexPrefix)+4)
 		copy(prefix, bucketIndexPrefix)
 		copy(prefix[len(bucketIndexPrefix):], bucketID)
-		bucketRange := util.BytesPrefix(prefix)
+		bucketRange := bytesPrefix(prefix)
 
 		dbIter = b.tx.snapshot.NewIterator(bucketRange)
-		pendingBucketIter := newLdbTreapIter(b.tx, bucketRange)
+		pendingBucketIter := newPendingTreapIter(b.tx, bucketRange)
 		pendingIter = pendingBucketIter
 
 	case ctFull:
@@ -523,26 +525,24 @@ func newCursor(b *bucket, bucketID []byte, cursorTyp cursorType) *cursor {
 		prefix := make([]byte, len(bucketIndexPrefix)+4)
 		copy(prefix, bucketIndexPrefix)
 		copy(prefix[len(bucketIndexPrefix):], bucketID)
-		bucketRange := util.BytesPrefix(prefix)
-		keyRange := util.BytesPrefix(bucketID)
+		bucketRange := bytesPrefix(prefix)
+		keyBounds := bytesPrefix(bucketID)
 
 		// Since both keys and buckets are needed from the database,
 		// create an individual iterator for each prefix and then create
 		// a merged iterator from them.
-		dbKeyIter := b.tx.snapshot.NewIterator(keyRange)
+		dbKeyIter := b.tx.snapshot.NewIterator(keyBounds)
 		dbBucketIter := b.tx.snapshot.NewIterator(bucketRange)
-		iters := []iterator.Iterator{dbKeyIter, dbBucketIter}
-		dbIter = iterator.NewMergedIterator(iters,
-			comparer.DefaultComparer, true)
+		iters := []dbIterator{dbKeyIter, dbBucketIter}
+		dbIter = newMergedIterator(iters)
 
 		// Since both keys and buckets are needed from the pending keys,
 		// create an individual iterator for each prefix and then create
 		// a merged iterator from them.
-		pendingKeyIter := newLdbTreapIter(b.tx, keyRange)
-		pendingBucketIter := newLdbTreapIter(b.tx, bucketRange)
-		iters = []iterator.Iterator{pendingKeyIter, pendingBucketIter}
-		pendingIter = iterator.NewMergedIterator(iters,
-			comparer.DefaultComparer, true)
+		pendingKeyIter := newPendingTreapIter(b.tx, keyBounds)
+		pendingBucketIter := newPendingTreapIter(b.tx, bucketRange)
+		iters = []dbIterator{pendingKeyIter, pendingBucketIter}
+		pendingIter = newMergedIterator(iters)
 	}
 
 	// Create the cursor using the iterators.
@@ -771,9 +771,11 @@ func (b *bucket) Cursor() database.Cursor {
 		return &cursor{bucket: b}
 	}
 
-	// Create the cursor and setup a runtime finalizer to ensure the
-	// iterators are released when the cursor is garbage collected.
+	// Create the cursor, register it with the transaction so its
+	// iterators are released when that closes, and set up a runtime
+	// finalizer as a backstop for a cursor dropped before then.
 	c := newCursor(b, b.id[:], ctFull)
+	b.tx.addActiveCursor(c)
 	runtime.SetFinalizer(c, cursorFinalizer)
 	return c
 }
@@ -979,6 +981,17 @@ type transaction struct {
 	// transaction state.
 	activeIterLock sync.RWMutex
 	activeIters    []*treap.Iterator
+
+	// activeCursors tracks the cursors created against this transaction
+	// so the iterators they hold can be released when it closes.
+	//
+	// A cursor also registers a finalizer, but that only runs whenever
+	// the collector gets to it.  The storage engine refuses to close a
+	// snapshot or a store while an iterator taken from it is still open,
+	// so waiting on the collector would turn an ordinary cursor into an
+	// intermittent close failure.
+	activeCursorLock sync.Mutex
+	activeCursors    []*cursor
 }
 
 // Enforce transaction implements the database.Tx interface.
@@ -999,6 +1012,28 @@ func (tx *transaction) removeActiveIter(iter *treap.Iterator) {
 		}
 	}
 	tx.activeIterLock.Unlock()
+}
+
+// addActiveCursor adds the passed cursor to the list of cursors whose
+// iterators must be released when the transaction closes.
+func (tx *transaction) addActiveCursor(c *cursor) {
+	tx.activeCursorLock.Lock()
+	tx.activeCursors = append(tx.activeCursors, c)
+	tx.activeCursorLock.Unlock()
+}
+
+// releaseActiveCursors releases the iterators held by every cursor created
+// against this transaction.  Releasing a cursor more than once is harmless,
+// so this is safe alongside the explicit and finalizer-driven releases.
+func (tx *transaction) releaseActiveCursors() {
+	tx.activeCursorLock.Lock()
+	cursors := tx.activeCursors
+	tx.activeCursors = nil
+	tx.activeCursorLock.Unlock()
+
+	for _, c := range cursors {
+		cursorFinalizer(c)
+	}
 }
 
 // addActiveIter adds the passed iterator to the list of active iterators for
@@ -1604,6 +1639,11 @@ func (tx *transaction) close() {
 	tx.pendingKeys = nil
 	tx.pendingRemove = nil
 
+	// Release any iterators the cursors still hold.  This has to happen
+	// before the snapshot is released, since the engine refuses to close
+	// a snapshot that still has open iterators taken from it.
+	tx.releaseActiveCursors()
+
 	// Release the snapshot.
 	if tx.snapshot != nil {
 		tx.snapshot.Release()
@@ -1864,7 +1904,7 @@ type db struct {
 	closeLock sync.RWMutex // Make database close block while txns active.
 	closed    bool         // Is the database closed?
 	store     *blockStore  // Handles read/writing blocks to flat files.
-	cache     *dbCache     // Cache layer which wraps underlying leveldb DB.
+	cache     *dbCache     // Cache layer wrapping the metadata store.
 }
 
 // Enforce db implements the database.DB interface.
@@ -2052,7 +2092,7 @@ func (db *db) Close() error {
 	// cache and clear all state without the individual locks.
 
 	// Close the database cache which will flush any existing entries to
-	// disk and close the underlying leveldb database.  Any error is saved
+	// disk and close the underlying metadata store.  Any error is saved
 	// and returned at the end after the remaining cleanup since the
 	// database will be marked closed even if this fails given there is no
 	// good way for the caller to recover from a failure here anyways.
@@ -2086,12 +2126,16 @@ func fileExists(name string) bool {
 
 // initDB creates the initial buckets and values used by the package.  This is
 // mainly in a separate function for testing purposes.
-func initDB(ldb *leveldb.DB) error {
+func initDB(metaDB *pebble.DB) (err error) {
+	defer recoverClosed(&err)
+
 	// The starting block file write cursor location is file num 0, offset
 	// 0.
-	batch := new(leveldb.Batch)
-	batch.Put(bucketizedKey(metadataBucketID, writeLocKeyName),
-		serializeWriteRow(0, 0))
+	batch := metaDB.NewBatch()
+	defer batch.Close()
+
+	batch.Set(bucketizedKey(metadataBucketID, writeLocKeyName),
+		serializeWriteRow(0, 0), nil)
 
 	// Create block index bucket and set the current bucket id.
 	//
@@ -2099,15 +2143,15 @@ func initDB(ldb *leveldb.DB) error {
 	// there is no need to store the bucket index data for the metadata
 	// bucket in the database.  However, the first bucket ID to use does
 	// need to account for it to ensure there are no key collisions.
-	batch.Put(bucketIndexKey(metadataBucketID, blockIdxBucketName),
-		blockIdxBucketID[:])
-	batch.Put(curBucketIDKeyName, blockIdxBucketID[:])
+	batch.Set(bucketIndexKey(metadataBucketID, blockIdxBucketName),
+		blockIdxBucketID[:], nil)
+	batch.Set(curBucketIDKeyName, blockIdxBucketID[:], nil)
 
-	// Write everything as a single batch.
-	if err := ldb.Write(batch, nil); err != nil {
+	// Write everything as a single durable batch.
+	if commitErr := batch.Commit(pebble.Sync); commitErr != nil {
 		str := fmt.Sprintf("failed to initialize metadata database: %v",
-			err)
-		return convertErr(str, err)
+			commitErr)
+		return convertErr(str, commitErr)
 	}
 
 	return nil
@@ -2126,20 +2170,28 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 
 	// Ensure the full path to the database exists.
 	if !dbExists {
-		// The error can be ignored here since the call to
-		// leveldb.OpenFile will fail if the directory couldn't be
-		// created.
+		// The error can be ignored here since opening the store will
+		// fail if the directory couldn't be created.
 		_ = os.MkdirAll(dbPath, 0700)
 	}
 
 	// Open the metadata database (will create it if needed).
-	opts := opt.Options{
-		ErrorIfExist: create,
-		Strict:       opt.DefaultStrict,
-		Compression:  opt.NoCompression,
-		Filter:       filter.NewBloomFilter(10),
+	//
+	// Compression stays off and the bloom filter keeps its ten bits per
+	// key so the stored bytes and the lookup behaviour match what this
+	// package has always produced.  The engine wants those set per level
+	// rather than globally.
+	opts := &pebble.Options{
+		ErrorIfExists: create,
 	}
-	ldb, err := leveldb.OpenFile(metadataDbPath, &opts)
+	opts.Levels = make([]pebble.LevelOptions, numMetadataLevels)
+	for i := range opts.Levels {
+		opts.Levels[i].Compression = pebble.NoCompression
+		opts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+		opts.Levels[i].FilterType = pebble.TableFilter
+	}
+
+	metaDB, err := pebble.Open(metadataDbPath, opts)
 	if err != nil {
 		return nil, convertErr(err.Error(), err)
 	}
@@ -2147,13 +2199,13 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 	// Create the block store which includes scanning the existing flat
 	// block files to find what the current write cursor position is
 	// according to the data that is actually on disk.  Also create the
-	// database cache which wraps the underlying leveldb database to provide
+	// database cache which wraps the underlying metadata store to provide
 	// write caching.
 	store, err := newBlockStore(dbPath, network)
 	if err != nil {
 		return nil, convertErr(err.Error(), err)
 	}
-	cache := newDbCache(ldb, store, defaultCacheSize, defaultFlushSecs)
+	cache := newDbCache(metaDB, store, defaultCacheSize, defaultFlushSecs)
 	pdb := &db{store: store, cache: cache}
 
 	// Perform any reconciliation needed between the block and metadata as
