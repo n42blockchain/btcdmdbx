@@ -34,6 +34,7 @@ type config struct {
 	checkpoint int
 	lookups    int
 	history    int
+	readFactor float64
 	seed       uint64
 	dir        string
 	jsonOut    string
@@ -121,6 +122,11 @@ func parseFlags() *config {
 		"blocks folded into one durable commit")
 	flag.IntVar(&cfg.lookups, "lookups", 50000,
 		"cold point lookups to perform after reopening")
+	flag.Float64Var(&cfg.readFactor, "reads-per-spend", 2.0,
+		"prevout lookups performed per spend. Block connection does "+
+			"one; a transaction that passed through the mempool "+
+			"was already validated once, so a serving node does "+
+			"roughly two. Set to 1 to model pure IBD.")
 	flag.IntVar(&cfg.history, "history", 900000,
 		"synthetic chain height the prefilled set is spread across, "+
 			"which bounds the coin ages the run can express")
@@ -130,8 +136,8 @@ func parseFlags() *config {
 		"working directory (default: a temporary directory)")
 	flag.StringVar(&cfg.jsonOut, "json", "",
 		"write the full report to this path as JSON")
-	flag.StringVar(&cfg.engines, "engines", "leveldb,mdbx",
-		"comma-separated engines to run")
+	flag.StringVar(&cfg.engines, "engines", "leveldb,pebble,bbolt,mdbx",
+		"comma-separated engines: leveldb, pebble, bbolt, badger, mdbx")
 	flag.BoolVar(&cfg.keep, "keep", false,
 		"keep the store directories after the run")
 	flag.IntVar(&mdbxPageSize, "mdbx-pagesize", mdbxDefaultPageSize,
@@ -167,13 +173,14 @@ func run(cfg *config) error {
 
 	rep := &report{
 		Config: map[string]int{
-			"utxos":      cfg.utxos,
-			"blocks":     cfg.blocks,
-			"creates":    cfg.creates,
-			"spends":     cfg.spends,
-			"checkpoint": cfg.checkpoint,
-			"lookups":    cfg.lookups,
-			"history":    cfg.history,
+			"utxos":                cfg.utxos,
+			"blocks":               cfg.blocks,
+			"creates":              cfg.creates,
+			"spends":               cfg.spends,
+			"checkpoint":           cfg.checkpoint,
+			"lookups":              cfg.lookups,
+			"history":              cfg.history,
+			"reads_per_spend_x100": int(cfg.readFactor * 100),
 		},
 	}
 
@@ -185,6 +192,12 @@ func run(cfg *config) error {
 			eng = newLevelDBEngine()
 		case "mdbx":
 			eng = newMDBXEngine()
+		case "pebble":
+			eng = newPebbleEngine()
+		case "bbolt":
+			eng = newBoltEngine()
+		case "badger":
+			eng = newBadgerEngine()
 		default:
 			return fmt.Errorf("unknown engine %q", name)
 		}
@@ -304,8 +317,23 @@ func benchmarkEngine(eng engine, cfg *config, dir string) (*engineResult,
 				if !ok {
 					break
 				}
-				if _, err := g.get(key[:]); err != nil {
-					return err
+
+				// Resolve the prevout once for block
+				// connection, plus however many extra times
+				// the read factor calls for. A node that
+				// accepted this transaction into its mempool
+				// already resolved the same outpoint then.
+				reads := int(cfg.readFactor)
+				if reads < 1 {
+					reads = 1
+				}
+				for r := 0; r < reads; r++ {
+					if _, err := g.get(key[:]); err != nil {
+						return err
+					}
+					if r > 0 {
+						operations++
+					}
 				}
 				keyCopy := make([]byte, 36)
 				copy(keyCopy, key[:])
