@@ -4,12 +4,15 @@ Phase 0 of `docs/storage_design.md`. The gate was: *MDBX demonstrably wins on
 point lookups plus batched inserts and deletes, with ordered iteration for
 snapshot export.*
 
-**It does not.** MDBX wins reads and loses space badly, and the space loss is
-confirmed at production scale on this machine's own 771 GB mainnet dataset —
-not inferred from a synthetic run.
+**It does not, and the reason is not the one expected.** At realistic set
+sizes MDBX has no measurable read advantage — every engine is disk-bound and
+lands within 8% of the others — while costing 1.6x to 5x the disk space. The
+space penalty is confirmed at production scale on this machine's own 771 GB
+mainnet dataset, not inferred from a synthetic run.
 
 Two independent sources of evidence follow: measurements from a real
-btcd-on-MDBX mainnet store, and a synthetic benchmark across five engines.
+btcd-on-MDBX mainnet store, and a synthetic benchmark across five engines in
+two scenarios.
 
 ---
 
@@ -162,8 +165,64 @@ cross-check.
 
 ### Engine results
 
-Results are recorded in `storagebench/` runs; see the tables in the sections
-that follow once the scenario runs complete.
+Two scenarios, because the engines trade reads against writes and the ratio
+differs sharply between a node catching up and a node serving.
+
+**Scenario A — serving node.** One durable commit per block, two prevout
+lookups per spend (the mempool already resolved it once). 2,000,000 prefilled
+UTXOs, 200 blocks at mainnet rates (5,000 created / 4,700 spent per block).
+
+| Engine | prefill | connect | cold-lookup | iterate | B/utxo | disk MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| leveldb | 173,023 | 67,842 | 11,574 | 8.19M | 77.6 | 152.4 |
+| pebble | 228,377 | 36,650 | 10,926 | 9.31M | 77.3 | 151.9 |
+| bbolt | 19,135 | 22,735 | 11,537 | 49.69M | 85.5 | 512.0 |
+| badger | **492,325** | **69,896** | 11,204 | 5.17M | 94.6 | 186.9 |
+| mdbx | 20,988 | 24,315 | 11,652 | 10.98M | 126.1 | 288.0 |
+
+**Scenario B — initial block download.** 256 blocks folded into one commit as
+the design specifies, one lookup per spend. 512 blocks connected.
+
+| Engine | prefill | connect | cold-lookup | iterate | B/utxo | disk MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| leveldb | 233,945 | 30,663 | 3,457 | 6.70M | 77.4 | 159.0 |
+| pebble | **744,477** | 32,082 | 3,404 | 7.96M | 77.2 | 158.6 |
+| badger | 349,814 | 29,210 | 3,682 | 5.99M | 103.6 | 213.8 |
+| mdbx | 652,255 | **32,988** | 3,520 | **8.70M** | 197.1 | **800.0** |
+
+bbolt is absent from scenario B: at 1.28 million records per transaction it
+had not finished a single commit after twenty minutes. That is a result, not
+an omission — bbolt cannot take checkpoint-sized batches.
+
+### Three findings
+
+**1. Reads are not an engine decision at this scale.** Cold lookups land
+within 6% across all five engines in scenario A (10,926–11,652 ops/s) and
+within 8% in scenario B. At 85 and 290 microseconds per lookup respectively,
+every engine is waiting on the same disk. The 1.79x MDBX read advantage
+measured in an earlier one-million-record run was an artifact of the working
+set fitting in page cache; it disappears once it does not.
+
+This removes MDBX's only measured advantage.
+
+**2. Batch size dominates B-tree write performance, and it is paid for in
+space.** MDBX's prefill throughput goes from 20,988 ops/s at one commit per
+block to 652,255 at 256 — a factor of 31 — which confirms design section A.6's
+insistence on sorted checkpoint batching. In scenario B its connect throughput
+is the fastest of any engine.
+
+But the same batching drives its disk footprint from 288 MB to **800 MB**,
+against a flat 159 MB for leveldb and Pebble. A copy-on-write B-tree taking a
+1.28-million-record transaction dirties an enormous number of pages, and the
+freed ones stay in the file. This is the mechanism behind the production
+store's 76 GB, observed directly at small scale.
+
+**MDBX's one remaining advantage is bought with a 5x space penalty.**
+
+**3. Pebble matches leveldb's space and beats it on writes.** 77.2 versus 77.4
+bytes per UTXO, 744,477 versus 233,945 ops/s on bulk insert, pure Go, actively
+maintained, and go-ethereum's default. If the storage layer is going to be
+touched at all, this is the low-risk direction.
 
 ---
 
@@ -172,10 +231,13 @@ that follow once the scenario runs complete.
 **Do not migrate the chainstate to MDBX on performance grounds.**
 
 The production store settles it: 76 GB of MDBX file for 11.7 GB of records,
-34% of it unreclaimable, against 10–15 GB for the same data on leveldb. The
-read advantage MDBX does have — consistently 1.5–1.8x in the synthetic runs —
-does not pay for roughly 60 GB of extra disk on a mainnet node, and there is
-currently no Go binding able to compact it back.
+34% of it unreclaimable, against 10–15 GB for the same data on leveldb. And
+the advantage that was supposed to pay for it is not there: at two million
+records every engine tested serves cold lookups within 8% of every other,
+because they are all waiting on the same disk. MDBX's one real strength —
+absorbing very large sorted batches — is itself paid for in space, driving the
+footprint from 288 MB to 800 MB as the checkpoint grows. There is also no Go
+binding currently able to compact any of it back.
 
 The design document's central argument was never performance:
 
@@ -210,10 +272,16 @@ should be recorded as such rather than attributed to performance.
 
 ## Caveats
 
-- The synthetic runs are single runs without medians. The connect figure was
-  observed to swing between 1.00x and 1.32x across identical configurations.
+- The synthetic runs are single runs without medians. An MDBX connect figure
+  was observed to swing between 1.00x and 1.32x relative to leveldb across
+  identical configurations, so differences under roughly 1.5x should not be
+  read as real.
 - Synthetic set sizes reach 2 million records; mainnet is 180 million. The
   production measurements above cover that gap for space but not for speed.
+  Note that the read finding runs the other way from most scaling concerns:
+  the larger the set relative to memory, the more completely disk latency
+  dominates, so a bigger run would flatten the engines further, not separate
+  them.
 - Windows only. fsync behaviour is platform-specific.
 - No concurrency and no crash testing. MDBX's readers never block writers and
   leveldb's compaction can stall; a single-threaded benchmark sees neither.
