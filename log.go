@@ -6,9 +6,12 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/btcsuite/btcd/addrmgr"
 	"github.com/btcsuite/btcd/blockchain"
@@ -27,14 +30,133 @@ import (
 	"github.com/jrick/logrotate/rotator"
 )
 
-// logWriter implements an io.Writer that outputs to both standard output and
-// the write-end pipe of an initialized log rotator.
-type logWriter struct{}
+const (
+	colorReset        = "\033[0m"
+	colorGray         = "\033[90m"
+	colorRed          = "\033[31m"
+	colorGreen        = "\033[32m"
+	colorYellow       = "\033[33m"
+	colorBlue         = "\033[34m"
+	colorCyan         = "\033[36m"
+	colorWhite        = "\033[37m"
+	colorLightBlue    = "\033[38;5;117m"
+	colorLightOrange  = "\033[38;5;215m"
+	colorLightMagenta = "\033[38;5;213m"
+)
 
-func (logWriter) Write(p []byte) (n int, err error) {
-	os.Stdout.Write(p)
-	logRotator.Write(p)
-	return len(p), nil
+// Regex patterns compiled once at package level.
+var (
+	logPattern          = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+\[(\w+)\]\s+(\w+):\s+(.*)$`)
+	processedPattern    = regexp.MustCompile(`(?i)(Processed\s+)(\d+)(\s+blocks)`)
+	heightPattern       = regexp.MustCompile(`(?i)(height\s+)(\d+)`)
+	transactionsPattern = regexp.MustCompile(`(?i)(\d+)(\s+transactions,?)`)
+)
+
+type colorizedWriter struct {
+	buffer []byte
+}
+
+func newColorizedWriter() *colorizedWriter {
+	enableWindowsANSIColors()
+	return &colorizedWriter{
+		buffer: make([]byte, 0, 4096),
+	}
+}
+
+// btclog emits 3-char level tags: TRC, DBG, INF, WRN, ERR, CRT.
+func getLevelColor(level string) string {
+	switch level {
+	case "TRC":
+		return colorCyan
+	case "DBG":
+		return colorBlue
+	case "INF":
+		return colorGreen
+	case "WRN":
+		return colorYellow
+	case "ERR", "CRT":
+		return colorRed
+	default:
+		return colorWhite
+	}
+}
+
+func colorizeMessage(message string) string {
+	// Pre-check with cheap string searches before running regex.
+	if strings.Contains(message, "rocess") {
+		message = processedPattern.ReplaceAllString(message, "${1}"+colorLightOrange+"${2}"+colorReset+"${3}")
+	}
+	if strings.Contains(message, "eight") {
+		message = heightPattern.ReplaceAllString(message, "${1}"+colorLightBlue+"${2}"+colorReset)
+	}
+	if strings.Contains(message, "ransaction") {
+		message = transactionsPattern.ReplaceAllString(message, colorLightMagenta+"${1}"+colorReset+"${2}")
+	}
+	return message
+}
+
+func colorizeLine(line string) string {
+	hasLF := strings.HasSuffix(line, "\n")
+	line = strings.TrimRight(line, "\r\n")
+
+	matches := logPattern.FindStringSubmatch(line)
+	if len(matches) == 5 {
+		var b strings.Builder
+		b.WriteString(colorGray)
+		b.WriteString(matches[1])
+		b.WriteString(colorReset)
+		b.WriteString(" [")
+		b.WriteString(getLevelColor(matches[2]))
+		b.WriteString(matches[2])
+		b.WriteString(colorReset)
+		b.WriteString("] ")
+		b.WriteString(colorCyan)
+		b.WriteString(matches[3])
+		b.WriteString(colorReset)
+		b.WriteString(": ")
+		b.WriteString(colorizeMessage(matches[4]))
+		if hasLF {
+			b.WriteByte('\n')
+		}
+		return b.String()
+	}
+
+	if hasLF {
+		return line + "\n"
+	}
+	return line
+}
+
+func (cw *colorizedWriter) Write(p []byte) (n int, err error) {
+	if logRotator != nil {
+		logRotator.Write(p)
+	}
+
+	cw.buffer = append(cw.buffer, p...)
+
+	start := 0
+	for {
+		rel := bytes.IndexByte(cw.buffer[start:], '\n')
+		if rel == -1 {
+			break
+		}
+		end := start + rel + 1
+		if _, err = os.Stdout.WriteString(colorizeLine(string(cw.buffer[start:end]))); err != nil {
+			break
+		}
+		start = end
+	}
+
+	// Reset when drained so the backing array is reused instead of growing
+	// unbounded; otherwise compact the tail back to the start.
+	switch {
+	case start == len(cw.buffer):
+		cw.buffer = cw.buffer[:0]
+	case start > 0:
+		cw.buffer = cw.buffer[:copy(cw.buffer, cw.buffer[start:])]
+	}
+
+	return len(p), err
 }
 
 // Loggers per subsystem.  A single backend logger is created and all subsystem
@@ -49,7 +171,7 @@ var (
 	// backendLog is the logging backend used to create all subsystem loggers.
 	// The backend must not be used before the log rotator has been initialized,
 	// or data races and/or nil pointer dereferences will occur.
-	backendLog = btclog.NewBackend(logWriter{})
+	backendLog = btclog.NewBackend(newColorizedWriter())
 
 	// logRotator is one of the logging outputs.  It should be closed on
 	// application shutdown.
