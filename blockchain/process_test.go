@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain/internal/testhelper"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,7 +36,8 @@ func chainedHeaders(parent *wire.BlockHeader, chainParams *chaincfg.Params,
 		merkle := chainhash.HashH(randBytes[:])
 
 		header := wire.BlockHeader{
-			Version:    1,
+			// Regtest enforces the BIP34/65/66 version floor from height 1.
+			Version:    4,
 			PrevBlock:  tip.BlockHash(),
 			MerkleRoot: merkle,
 			Bits:       chainParams.PowLimitBits,

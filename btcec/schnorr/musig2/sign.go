@@ -11,7 +11,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/chainhash/v2"
 )
 
 var (
@@ -91,7 +91,7 @@ func (p *PartialSignature) Decode(r io.Reader) error {
 
 	var sBytes [32]byte
 	if _, err := io.ReadFull(r, sBytes[:]); err != nil {
-		return nil
+		return err
 	}
 
 	overflows := p.S.SetBytes(&sBytes)

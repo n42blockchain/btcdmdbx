@@ -26,20 +26,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/blockchain/indexers"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcjson"
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/mining"
 	"github.com/btcsuite/btcd/mining/cpuminer"
 	"github.com/btcsuite/btcd/peer"
-	"github.com/btcsuite/btcd/txscript"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/websocket"
 )
 
@@ -564,7 +565,7 @@ func handleCreateRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan 
 		}
 
 		// Decode the provided address.
-		addr, err := btcutil.DecodeAddress(encodedAddr, params)
+		addr, err := address.DecodeAddress(encodedAddr, params)
 		if err != nil {
 			return nil, &btcjson.RPCError{
 				Code:    btcjson.ErrRPCInvalidAddressOrKey,
@@ -576,8 +577,8 @@ func handleCreateRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan 
 		// the network encoded with the address matches the network the
 		// server is currently on.
 		switch addr.(type) {
-		case *btcutil.AddressPubKeyHash:
-		case *btcutil.AddressScriptHash:
+		case *address.AddressPubKeyHash:
+		case *address.AddressScriptHash:
 		default:
 			return nil, &btcjson.RPCError{
 				Code:    btcjson.ErrRPCInvalidAddressOrKey,
@@ -790,22 +791,22 @@ func handleDecodeRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan 
 	if err != nil {
 		return nil, rpcDecodeHexError(hexStr)
 	}
-	var mtx wire.MsgTx
-	err = mtx.Deserialize(bytes.NewReader(serializedTx))
+	tx, err := btcutil.NewTxFromBytes(serializedTx)
 	if err != nil {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCDeserialization,
 			Message: "TX decode failed: " + err.Error(),
 		}
 	}
+	mtx := tx.MsgTx()
 
 	// Create and return the result.
 	txReply := btcjson.TxRawDecodeResult{
 		Txid:     mtx.TxHash().String(),
 		Version:  mtx.Version,
 		Locktime: mtx.LockTime,
-		Vin:      createVinList(&mtx),
-		Vout:     createVoutList(&mtx, s.cfg.ChainParams, nil),
+		Vin:      createVinList(mtx),
+		Vout:     createVoutList(mtx, s.cfg.ChainParams, nil),
 	}
 	return txReply, nil
 }
@@ -839,7 +840,7 @@ func handleDecodeScript(s *rpcServer, cmd interface{}, closeChan <-chan struct{}
 	}
 
 	// Convert the script itself to a pay-to-script-hash address.
-	p2sh, err := btcutil.NewAddressScriptHash(script, s.cfg.ChainParams)
+	p2sh, err := address.NewAddressScriptHash(script, s.cfg.ChainParams)
 	if err != nil {
 		context := "Failed to convert script to pay-to-script-hash"
 		return nil, internalRPCError(err.Error(), context)
@@ -1081,9 +1082,17 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 	}
 	var blkBytes []byte
 	err = s.cfg.DB.View(func(dbTx database.Tx) error {
-		var err error
-		blkBytes, err = dbTx.FetchBlock(hash)
-		return err
+		dbBlockBytes, err := dbTx.FetchBlock(hash)
+		if err != nil {
+			return err
+		}
+
+		// FetchBlock bytes are only valid for the lifetime of the
+		// transaction. Copy them before returning from the view so the
+		// lenient parser below owns its backing memory.
+		blkBytes = append([]byte(nil), dbBlockBytes...)
+
+		return nil
 	})
 	if err != nil {
 		return nil, &btcjson.RPCError{
@@ -1091,19 +1100,27 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 			Message: "Block not found",
 		}
 	}
+	// Deserialize the block.  Blocks read back from the node's own
+	// database are parsed leniently: trailing bytes persisted by older
+	// btcd versions are stripped rather than treated as an error, so the
+	// bytes served below are always the exact block serialization.
+	blk, err := blockchain.DBBlockFromBytes(blkBytes, *hash)
+	if err != nil {
+		context := "Failed to deserialize block"
+		return nil, internalRPCError(err.Error(), context)
+	}
+	blkBytes, err = blk.Bytes()
+	if err != nil {
+		context := "Failed to serialize block"
+		return nil, internalRPCError(err.Error(), context)
+	}
+
 	// If verbosity is 0, return the serialized block as a hex encoded string.
 	if c.Verbosity != nil && *c.Verbosity == 0 {
 		return hex.EncodeToString(blkBytes), nil
 	}
 
 	// Otherwise, generate the JSON object and return it.
-
-	// Deserialize the block.
-	blk, err := btcutil.NewBlockFromBytes(blkBytes)
-	if err != nil {
-		context := "Failed to deserialize block"
-		return nil, internalRPCError(err.Error(), context)
-	}
 
 	// Get the block height from chain.
 	blockHeight, err := s.cfg.Chain.BlockHeightByHash(hash)
@@ -1588,7 +1605,7 @@ func (state *gbtWorkState) updateBlockTemplate(s *rpcServer, useCoinbaseValue bo
 		// Choose a payment address at random if the caller requests a
 		// full coinbase as opposed to only the pertinent details needed
 		// to create their own coinbase.
-		var payAddr btcutil.Address
+		var payAddr address.Address
 		if !useCoinbaseValue {
 			payAddr = cfg.miningAddrs[rand.Intn(len(cfg.miningAddrs))]
 		}
@@ -2140,14 +2157,13 @@ func handleGetBlockTemplateProposal(s *rpcServer, request *btcjson.TemplateReque
 				"hexadecimal string (not %q)", hexData),
 		}
 	}
-	var msgBlock wire.MsgBlock
-	if err := msgBlock.Deserialize(bytes.NewReader(dataBytes)); err != nil {
+	block, err := btcutil.NewBlockFromBytes(dataBytes)
+	if err != nil {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCDeserialization,
 			Message: "Block decode failed: " + err.Error(),
 		}
 	}
-	block := btcutil.NewBlock(&msgBlock)
 
 	// Ensure the block is building from the expected previous block.
 	expectedPrevHash := s.cfg.Chain.BestSnapshot().Hash
@@ -3127,7 +3143,9 @@ func createVinListPrevOut(s *rpcServer, mtx *wire.MsgTx, chainParams *chaincfg.P
 // fetchMempoolTxnsForAddress queries the address index for all unconfirmed
 // transactions that involve the provided address.  The results will be limited
 // by the number to skip and the number requested.
-func fetchMempoolTxnsForAddress(s *rpcServer, addr btcutil.Address, numToSkip, numRequested uint32) ([]*btcutil.Tx, uint32) {
+func fetchMempoolTxnsForAddress(s *rpcServer, addr address.Address, numToSkip,
+	numRequested uint32) ([]*btcutil.Tx, uint32) {
+
 	// There are no entries to return when there are less available than the
 	// number being skipped.
 	mpTxns := s.cfg.AddrIndex.UnconfirmedTxnsForAddress(addr)
@@ -3194,7 +3212,7 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 
 	// Attempt to decode the supplied address.
 	params := s.cfg.ChainParams
-	addr, err := btcutil.DecodeAddress(c.Address, params)
+	addr, err := address.DecodeAddress(c.Address, params)
 	if err != nil {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCInvalidAddressOrKey,
@@ -3438,8 +3456,7 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 	if err != nil {
 		return nil, rpcDecodeHexError(hexStr)
 	}
-	var msgTx wire.MsgTx
-	err = msgTx.Deserialize(bytes.NewReader(serializedTx))
+	tx, err := btcutil.NewTxFromBytes(serializedTx)
 	if err != nil {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCDeserialization,
@@ -3448,7 +3465,6 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 	}
 
 	// Use 0 for the tag to represent local node.
-	tx := btcutil.NewTx(&msgTx)
 	acceptedTxs, err := s.cfg.TxMemPool.ProcessTransaction(tx, false, false, 0)
 	if err != nil {
 		// When the error is a rule error, it means the transaction was
@@ -3578,7 +3594,7 @@ func handleSignMessageWithPrivKey(s *rpcServer, cmd interface{}, closeChan <-cha
 		switch err {
 		case btcutil.ErrMalformedPrivateKey:
 			message = "Malformed private key"
-		case btcutil.ErrChecksumMismatch:
+		case address.ErrChecksumMismatch:
 			message = "Private key checksum mismatch"
 		}
 		return nil, &btcjson.RPCError{
@@ -3655,32 +3671,32 @@ func handleValidateAddress(s *rpcServer, cmd interface{}, closeChan <-chan struc
 	c := cmd.(*btcjson.ValidateAddressCmd)
 
 	result := btcjson.ValidateAddressChainResult{}
-	addr, err := btcutil.DecodeAddress(c.Address, s.cfg.ChainParams)
+	addr, err := address.DecodeAddress(c.Address, s.cfg.ChainParams)
 	if err != nil {
 		// Return the default value (false) for IsValid.
 		return result, nil
 	}
 
 	switch addr := addr.(type) {
-	case *btcutil.AddressPubKeyHash:
+	case *address.AddressPubKeyHash:
 		result.IsScript = btcjson.Bool(false)
 		result.IsWitness = btcjson.Bool(false)
 
-	case *btcutil.AddressScriptHash:
+	case *address.AddressScriptHash:
 		result.IsScript = btcjson.Bool(true)
 		result.IsWitness = btcjson.Bool(false)
 
-	case *btcutil.AddressPubKey:
+	case *address.AddressPubKey:
 		result.IsScript = btcjson.Bool(false)
 		result.IsWitness = btcjson.Bool(false)
 
-	case *btcutil.AddressWitnessPubKeyHash:
+	case *address.AddressWitnessPubKeyHash:
 		result.IsScript = btcjson.Bool(false)
 		result.IsWitness = btcjson.Bool(true)
 		result.WitnessVersion = btcjson.Int32(int32(addr.WitnessVersion()))
 		result.WitnessProgram = btcjson.String(hex.EncodeToString(addr.WitnessProgram()))
 
-	case *btcutil.AddressWitnessScriptHash:
+	case *address.AddressWitnessScriptHash:
 		result.IsScript = btcjson.Bool(true)
 		result.IsWitness = btcjson.Bool(true)
 		result.WitnessVersion = btcjson.Int32(int32(addr.WitnessVersion()))
@@ -3755,7 +3771,7 @@ func handleVerifyMessage(s *rpcServer, cmd interface{}, closeChan <-chan struct{
 
 	// Decode the provided address.
 	params := s.cfg.ChainParams
-	addr, err := btcutil.DecodeAddress(c.Address, params)
+	addr, err := address.DecodeAddress(c.Address, params)
 	if err != nil {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCInvalidAddressOrKey,
@@ -3764,7 +3780,7 @@ func handleVerifyMessage(s *rpcServer, cmd interface{}, closeChan <-chan struct{
 	}
 
 	// Only P2PKH addresses are valid for signing.
-	if _, ok := addr.(*btcutil.AddressPubKeyHash); !ok {
+	if _, ok := addr.(*address.AddressPubKeyHash); !ok {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCType,
 			Message: "Address is not a pay-to-pubkey-hash address",
@@ -3801,7 +3817,7 @@ func handleVerifyMessage(s *rpcServer, cmd interface{}, closeChan <-chan struct{
 	} else {
 		serializedPK = pk.SerializeUncompressed()
 	}
-	address, err := btcutil.NewAddressPubKey(serializedPK, params)
+	addr2, err := address.NewAddressPubKey(serializedPK, params)
 	if err != nil {
 		// Again mirror Bitcoin Core behavior, which treats error in public key
 		// reconstruction as invalid signature.
@@ -3809,7 +3825,7 @@ func handleVerifyMessage(s *rpcServer, cmd interface{}, closeChan <-chan struct{
 	}
 
 	// Return boolean if addresses match.
-	return address.EncodeAddress() == c.Address, nil
+	return addr2.EncodeAddress() == c.Address, nil
 }
 
 // handleVersion implements the version command.

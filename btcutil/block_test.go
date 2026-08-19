@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/davecgh/go-spew/spew"
 )
 
@@ -197,6 +197,23 @@ func TestNewBlockFromBytes(t *testing.T) {
 	if msgBlock := b.MsgBlock(); !reflect.DeepEqual(msgBlock, &Block100000) {
 		t.Errorf("MsgBlock: mismatched MsgBlock - got %v, want %v",
 			spew.Sdump(msgBlock), spew.Sdump(&Block100000))
+	}
+}
+
+// TestNewBlockFromBytesRejectsTrailingData verifies that NewBlockFromBytes
+// rejects bytes after the serialized block.
+func TestNewBlockFromBytesRejectsTrailingData(t *testing.T) {
+	var block100000Buf bytes.Buffer
+	err := Block100000.Serialize(&block100000Buf)
+	if err != nil {
+		t.Errorf("Serialize: %v", err)
+	}
+
+	_, err = btcutil.NewBlockFromBytes(
+		append(block100000Buf.Bytes(), 0x00),
+	)
+	if err == nil {
+		t.Fatal("expected error for block with trailing data")
 	}
 }
 

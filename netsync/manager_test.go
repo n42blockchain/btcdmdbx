@@ -12,15 +12,15 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/database"
 	_ "github.com/btcsuite/btcd/database/ffldb"
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/peer"
-	"github.com/btcsuite/btcd/txscript"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -557,11 +557,15 @@ func TestIsInIBDMode(t *testing.T) {
 func createTestCoinbase(height int32, params *chaincfg.Params) *wire.MsgTx {
 	tx := wire.NewMsgTx(wire.TxVersion)
 
-	// Push the height as data to guarantee unique txids per block.
-	sigScript := []byte{
-		0x04,
-		byte(height), byte(height >> 8),
-		byte(height >> 16), byte(height >> 24),
+	// Encode the height as a minimally encoded script integer and add a trailing
+	// OP_0 so the script also satisfies the generic coinbase-length checks.
+	sigScript, err := txscript.NewScriptBuilder().
+		AddInt64(int64(height)).
+		AddInt64(0).
+		Script()
+	if err != nil {
+		panic(fmt.Sprintf("unable to encode coinbase height %d: %v",
+			height, err))
 	}
 
 	tx.AddTxIn(&wire.TxIn{
@@ -613,7 +617,8 @@ func generateTestBlocks(
 		merkleRoot := cb.TxHash()
 
 		header := wire.BlockHeader{
-			Version:    1,
+			// Regtest enforces the BIP34/65/66 version floor from height 1.
+			Version:    4,
 			PrevBlock:  *prevHash,
 			MerkleRoot: merkleRoot,
 			Timestamp:  prevTime.Add(time.Minute),
@@ -864,9 +869,10 @@ func syncSendHeaders(t *testing.T, sm *SyncManager,
 
 	t.Helper()
 
-	// Record the progress time set by startIBD so we can verify
-	// that handleHeadersMsg advances it.
-	progressBefore := sm.lastProgressTime
+	// Reset the progress time to a zero sentinel so the assertion below
+	// verifies that handleHeadersMsg writes it without depending on the
+	// system clock advancing between calls to time.Now.
+	sm.lastProgressTime = time.Time{}
 
 	headers := wire.NewMsgHeaders()
 	for _, block := range blocks {
@@ -882,7 +888,7 @@ func syncSendHeaders(t *testing.T, sm *SyncManager,
 	_, bestHeaderHeight := sm.chain.BestHeader()
 	require.Equal(t, int32(totalBlocks), bestHeaderHeight)
 
-	require.True(t, sm.lastProgressTime.After(progressBefore),
+	require.False(t, sm.lastProgressTime.IsZero(),
 		"handleHeadersMsg should update lastProgressTime")
 
 	wantRequested := make(map[chainhash.Hash]struct{}, len(blocks))
@@ -1187,7 +1193,8 @@ func TestStartSyncChainCurrent(t *testing.T) {
 	// IsCurrent() returns true.
 	cb := createTestCoinbase(1, &params)
 	header := wire.BlockHeader{
-		Version:    1,
+		// Regtest enforces the BIP34/65/66 version floor from height 1.
+		Version:    4,
 		PrevBlock:  *params.GenesisHash,
 		MerkleRoot: cb.TxHash(),
 		Timestamp:  time.Now().Truncate(time.Second),
@@ -1214,9 +1221,8 @@ func TestStartSyncChainCurrent(t *testing.T) {
 		"ibdMode should not be activated when chain is already current")
 }
 
-// TestIsSyncCandidateRegtest verifies that isSyncCandidate accepts any peer
-// on regtest regardless of address, including non-localhost Docker bridge
-// addresses.
+// TestIsSyncCandidateRegtest verifies that isSyncCandidate accepts peers
+// on regtest and simnet based on their service flags.
 func TestIsSyncCandidateRegtest(t *testing.T) {
 	t.Parallel()
 
@@ -1225,29 +1231,41 @@ func TestIsSyncCandidateRegtest(t *testing.T) {
 	defer tearDown()
 
 	tests := []struct {
-		name string
-		addr string
-		want bool
+		name      string
+		flags     wire.ServiceFlag
+		lastBlock int32
+		want      bool
 	}{
 		{
-			name: "localhost",
-			addr: "127.0.0.1:18444",
-			want: true,
+			name:  "just node network",
+			flags: wire.SFNodeNetwork,
+			want:  true,
 		},
 		{
-			name: "docker bridge ip",
-			addr: "172.18.0.2:18444",
-			want: true,
+			name:  "just limited network",
+			flags: wire.SFNodeNetworkLimited,
+			want:  true,
 		},
 		{
-			name: "remote ip",
-			addr: "93.184.216.34:18444",
-			want: true,
+			name:      "limited network with block ahead",
+			flags:     wire.SFNodeNetworkLimited,
+			lastBlock: wire.NodeNetworkLimitedBlockThreshold + 1,
+			want:      false,
 		},
 		{
-			name: "ipv6 loopback",
-			addr: "[::1]:18444",
-			want: true,
+			name:  "node network and limited node network",
+			flags: wire.SFNodeNetwork | wire.SFNodeNetworkLimited,
+			want:  true,
+		},
+		{
+			name:  "no flags",
+			flags: 0,
+			want:  false,
+		},
+		{
+			name:  "different flag",
+			flags: wire.SFNodeBloom,
+			want:  false,
 		},
 	}
 
@@ -1255,7 +1273,9 @@ func TestIsSyncCandidateRegtest(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p := peer.NewInboundPeer(&peer.Config{
 				ChainParams: sm.chainParams,
+				Services:    tc.flags,
 			})
+			p.UpdateLastBlockHeight(tc.lastBlock)
 
 			got := sm.isSyncCandidate(p)
 			require.Equal(t, tc.want, got)

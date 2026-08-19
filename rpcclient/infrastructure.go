@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcjson"
-	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/go-socks/socks"
 	"github.com/btcsuite/websocket"
 )
@@ -98,6 +98,10 @@ const (
 	// defaultHTTPTimeout is the default timeout for an http request, so the
 	// request does not block indefinitely.
 	defaultHTTPTimeout = time.Minute
+
+	// sendPostRequestTries is the number of times to retry failed HTTP POST
+	// requests before giving up.
+	sendPostRequestTries = 10
 )
 
 // jsonRequest holds information about a json request that is used to properly
@@ -139,6 +143,11 @@ type Client struct {
 	// httpClient is the underlying HTTP client to use when running in HTTP
 	// POST mode.
 	httpClient *http.Client
+
+	// httpURL is the request URL used for every HTTP POST. It depends only
+	// on the configured Host and DisableTLS, both of which are immutable
+	// after New, so it is computed once at construction time and reused.
+	httpURL string
 
 	// backendVersion is the version of the backend the client is currently
 	// connected to. This should be retrieved through GetVersion.
@@ -766,46 +775,51 @@ out:
 // handleSendPostMessage handles performing the passed HTTP request, reading the
 // result, unmarshalling it, and delivering the unmarshalled result to the
 // provided response channel.
-func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
+func (c *Client) handleSendPostMessage(ctx context.Context, jReq *jsonRequest) {
+	c.sendPostRequestAndRespond(ctx, jReq, sendPostRequestTries)
+}
+
+// sendPostRequestWithRetry performs HTTP POST retries and decodes the response
+// result. It returns the raw transport error so callers can decide how to map
+// shutdown-driven cancellation.
+func sendPostRequestWithRetry(ctx context.Context, jReq *jsonRequest,
+	tries int, httpClient *http.Client, config *ConnConfig,
+	httpURL string, batch bool) ([]byte, error) {
+
 	var (
 		lastErr      error
 		backoff      time.Duration
 		httpResponse *http.Response
+		err          error
 	)
 
-	httpURL, err := c.config.httpURL()
-	if err != nil {
-		jReq.responseChan <- &Response{
-			err: fmt.Errorf("failed to parse address %v", err),
-		}
-		return
-	}
-
-	tries := 10
+retryloop:
 	for i := 0; i < tries; i++ {
 		var httpReq *http.Request
 
 		bodyReader := bytes.NewReader(jReq.marshalledJSON)
-		httpReq, err = http.NewRequest("POST", httpURL, bodyReader)
+		httpReq, err = http.NewRequestWithContext(
+			ctx, "POST", httpURL, bodyReader,
+		)
 		if err != nil {
-			jReq.responseChan <- &Response{result: nil, err: err}
-			return
+			return nil, err
 		}
 		httpReq.Close = true
 		httpReq.Header.Set("Content-Type", "application/json")
-		for key, value := range c.config.ExtraHeaders {
+		for key, value := range config.ExtraHeaders {
 			httpReq.Header.Set(key, value)
 		}
 
-		// Configure basic access authorization.
-		user, pass, err := c.config.getAuth()
-		if err != nil {
-			jReq.responseChan <- &Response{result: nil, err: err}
-			return
+		// Configure generated basic access authorization.
+		if !config.DisableAuth {
+			user, pass, authErr := config.getAuth()
+			if authErr != nil {
+				return nil, authErr
+			}
+			httpReq.SetBasicAuth(user, pass)
 		}
-		httpReq.SetBasicAuth(user, pass)
 
-		httpResponse, err = c.httpClient.Do(httpReq)
+		httpResponse, err = httpClient.Do(httpReq)
 
 		// Quit the retry loop on success or if we can't retry anymore.
 		if err == nil || i == tries-1 {
@@ -830,39 +844,35 @@ func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
 		select {
 		case <-time.After(backoff):
 
-		case <-c.shutdown:
-			return
+		case <-ctx.Done():
+			// Stop retrying as soon as shutdown cancels the request context.
+			err = ctx.Err()
+			break retryloop
 		}
 	}
 	if err != nil {
-		jReq.responseChan <- &Response{err: err}
-		return
+		return nil, err
 	}
 
 	// We still want to return an error if for any reason the response
 	// remains empty.
 	if httpResponse == nil {
-		jReq.responseChan <- &Response{
-			err: fmt.Errorf("invalid http POST response (nil), "+
-				"method: %s, id: %d, last error=%v",
-				jReq.method, jReq.id, lastErr),
-		}
-		return
+		return nil, fmt.Errorf("invalid http POST response (nil), "+
+			"method: %s, id: %d, last error=%v",
+			jReq.method, jReq.id, lastErr)
 	}
 
 	// Read the raw bytes and close the response.
 	respBytes, err := io.ReadAll(httpResponse.Body)
 	httpResponse.Body.Close()
 	if err != nil {
-		err = fmt.Errorf("error reading json reply: %v", err)
-		jReq.responseChan <- &Response{err: err}
-		return
+		return nil, fmt.Errorf("error reading json reply: %w", err)
 	}
 
 	// Try to unmarshal the response as a regular JSON-RPC response.
 	var resp rawResponse
 	var batchResponse json.RawMessage
-	if c.batch {
+	if batch {
 		err = json.Unmarshal(respBytes, &batchResponse)
 	} else {
 		err = json.Unmarshal(respBytes, &resp)
@@ -871,39 +881,62 @@ func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
 		// When the response itself isn't a valid JSON-RPC response
 		// return an error which includes the HTTP status code and raw
 		// response bytes.
-		err = fmt.Errorf("status code: %d, response: %q",
+		return nil, fmt.Errorf("status code: %d, response: %q",
 			httpResponse.StatusCode, string(respBytes))
-		jReq.responseChan <- &Response{err: err}
-		return
 	}
-	var res []byte
-	if c.batch {
-		// errors must be dealt with downstream since a whole request cannot
-		// "error out" other than through the status code error handled above
-		res, err = batchResponse, nil
-	} else {
-		res, err = resp.result()
+
+	if batch {
+		// Errors must be dealt with downstream since a whole request
+		// cannot "error out" other than through the status code error
+		// handled above.
+		return batchResponse, nil
 	}
-	jReq.responseChan <- &Response{result: res, err: err}
+
+	return resp.result()
+}
+
+// sendPostRequestAndRespond runs the retrying POST path and sends the final
+// result to the waiting response channel.
+func (c *Client) sendPostRequestAndRespond(ctx context.Context,
+	jReq *jsonRequest, tries int) {
+
+	res, err := sendPostRequestWithRetry(
+		ctx, jReq, tries, c.httpClient, c.config, c.httpURL, c.batch,
+	)
+
+	// Preserve the client contract that shutdown-related cancellations surface
+	// as ErrClientShutdown, even when the transport reports context.Canceled.
+	if errors.Is(err, context.Canceled) &&
+		errors.Is(context.Cause(ctx), ErrClientShutdown) {
+
+		err = ErrClientShutdown
+	}
+
+	jReq.responseChan <- &Response{
+		result: res,
+		err:    err,
+	}
 }
 
 // sendPostHandler handles all outgoing messages when the client is running
 // in HTTP POST mode.  It uses a buffered channel to serialize output messages
 // while allowing the sender to continue running asynchronously.  It must be run
 // as a goroutine.
-func (c *Client) sendPostHandler() {
+func (c *Client) sendPostHandler(ctx context.Context) {
 out:
 	for {
 		// Send any messages ready for send until the shutdown channel
 		// is closed.
 		select {
 		case jReq := <-c.sendPostChan:
-			c.handleSendPostMessage(jReq)
+			c.handleSendPostMessage(ctx, jReq)
 
-		case <-c.shutdown:
+		case <-ctx.Done():
 			break out
 		}
 	}
+
+	err := context.Cause(ctx)
 
 	// Drain any wait channels before exiting so nothing is left waiting
 	// around to send.
@@ -911,10 +944,7 @@ cleanup:
 	for {
 		select {
 		case jReq := <-c.sendPostChan:
-			jReq.responseChan <- &Response{
-				result: nil,
-				err:    ErrClientShutdown,
-			}
+			jReq.responseChan <- &Response{result: nil, err: err}
 
 		default:
 			break cleanup
@@ -928,19 +958,32 @@ cleanup:
 // HTTP client associated with the client.  It is backed by a buffered channel,
 // so it will not block until the send channel is full.
 func (c *Client) sendPostRequest(jReq *jsonRequest) {
-	// Don't send the message if shutting down.
+	// Prefer shutdown when it is already closed so this path is
+	// deterministic. This mirrors addRequest and avoids post-shutdown
+	// enqueueing.
 	select {
 	case <-c.shutdown:
-		jReq.responseChan <- &Response{result: nil, err: ErrClientShutdown}
+		jReq.responseChan <- &Response{
+			result: nil,
+			err:    ErrClientShutdown,
+		}
+
+		return
+
 	default:
 	}
 
+	// Normal path: either enqueue, or fail if shutdown closes in the race
+	// window after the guard above.
 	select {
 	case c.sendPostChan <- jReq:
 		log.Tracef("Sent command [%s] with id %d", jReq.method, jReq.id)
 
 	case <-c.shutdown:
-		return
+		jReq.responseChan <- &Response{
+			result: nil,
+			err:    ErrClientShutdown,
+		}
 	}
 }
 
@@ -1178,8 +1221,13 @@ func (c *Client) start() {
 	// Start the I/O processing handlers depending on whether the client is
 	// in HTTP POST mode or the default websocket mode.
 	if c.config.HTTPPostMode {
+		ctx, cancel := context.WithCancelCause(context.Background())
 		c.wg.Add(1)
-		go c.sendPostHandler()
+		go c.sendPostHandler(ctx)
+		go func() {
+			<-c.shutdown
+			cancel(ErrClientShutdown)
+		}()
 	} else {
 		c.wg.Add(3)
 		go func() {
@@ -1284,6 +1332,11 @@ type ConnConfig struct {
 	// EnableBCInfoHacks is an option provided to enable compatibility hacks
 	// when connecting to blockchain.info RPC server
 	EnableBCInfoHacks bool
+
+	// DisableAuth instructs the client to skip generating a Basic
+	// Authorization header for RPC requests. Caller-provided Authorization
+	// values in ExtraHeaders are still sent.
+	DisableAuth bool
 }
 
 // getAuth returns the username and passphrase that will actually be used for
@@ -1372,30 +1425,23 @@ func newHTTPClient(config *ConnConfig) (*http.Client, error) {
 	return &client, nil
 }
 
-// httpURL returns the URL to use for HTTP POST requests.
-func (config *ConnConfig) httpURL() (string, error) {
+// httpURL returns the URL for HTTP POST requests. The Unix-socket case
+// returns a placeholder, since the path is dialed by the Transport's
+// DialContext. config.Host is not validated here, because newHTTPClient
+// already validates it via ParseAddressString.
+func (config *ConnConfig) httpURL() string {
 	protocol := "http"
 	if !config.DisableTLS {
 		protocol = "https"
 	}
 
-	parsedAddr, err := ParseAddressString(config.Host)
-	if err != nil {
-		return "", fmt.Errorf("error parsing host '%v': %v",
-			config.Host, err)
+	if strings.HasPrefix(config.Host, "unix://") ||
+		strings.HasPrefix(config.Host, "unixpacket://") {
+
+		return protocol + "://unix"
 	}
 
-	var httpURL string
-	switch parsedAddr.Network() {
-	case "unix", "unixpacket":
-		// Using a placeholder URL because a non-empty URL is required.
-		// The Unix domain socket is specified in the DialContext.
-		httpURL = protocol + "://unix"
-	default:
-		httpURL = protocol + "://" + config.Host
-	}
-
-	return httpURL, nil
+	return protocol + "://" + config.Host
 }
 
 // dial opens a websocket connection using the passed connection configuration
@@ -1430,16 +1476,18 @@ func dial(config *ConnConfig) (*websocket.Conn, error) {
 		dialer.NetDial = proxy.Dial
 	}
 
-	// The RPC server requires basic authorization, so create a custom
-	// request header with the Authorization header set.
-	user, pass, err := config.getAuth()
-	if err != nil {
-		return nil, err
-	}
-	login := user + ":" + pass
-	auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
+	// Configure generated basic access authorization. Caller-provided
+	// headers are added independently below.
 	requestHeader := make(http.Header)
-	requestHeader.Add("Authorization", auth)
+	if !config.DisableAuth {
+		user, pass, err := config.getAuth()
+		if err != nil {
+			return nil, err
+		}
+		login := user + ":" + pass
+		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
+		requestHeader.Add("Authorization", auth)
+	}
 	for key, value := range config.ExtraHeaders {
 		requestHeader.Add(key, value)
 	}
@@ -1482,6 +1530,7 @@ func New(config *ConnConfig, ntfnHandlers *NotificationHandlers) (*Client, error
 	// when running in HTTP POST mode.
 	var wsConn *websocket.Conn
 	var httpClient *http.Client
+	var httpURL string
 	connEstablished := make(chan struct{})
 	var start bool
 	if config.HTTPPostMode {
@@ -1493,6 +1542,7 @@ func New(config *ConnConfig, ntfnHandlers *NotificationHandlers) (*Client, error
 		if err != nil {
 			return nil, err
 		}
+		httpURL = config.httpURL()
 	} else {
 		if !config.DisableConnectOnNew {
 			var err error
@@ -1508,6 +1558,7 @@ func New(config *ConnConfig, ntfnHandlers *NotificationHandlers) (*Client, error
 		config:          config,
 		wsConn:          wsConn,
 		httpClient:      httpClient,
+		httpURL:         httpURL,
 		requestMap:      make(map[uint64]*list.Element),
 		requestList:     list.New(),
 		batch:           false,
@@ -1564,13 +1615,18 @@ func NewBatch(config *ConnConfig) (*Client, error) {
 	if !config.HTTPPostMode {
 		return nil, errors.New("http post mode is required to use batch client")
 	}
-	// notification parameter is nil since notifications are not supported in POST mode.
+
+	// The notification parameter is nil since notifications are not
+	// supported in POST mode.
 	client, err := New(config, nil)
 	if err != nil {
 		return nil, err
 	}
-	client.batch = true //copy the client with changed batch setting
-	client.start()
+
+	// New() already started the HTTP handlers, so only toggle batch
+	// semantics.
+	client.batch = true
+
 	return client, nil
 }
 
@@ -1716,6 +1772,38 @@ func (c *Client) sendAsync() (FutureGetBulkResult, error) {
 	return responseChan, nil
 }
 
+// failBatchRequests resolves every queued batch request with the provided error
+// and clears all internal request tracking.
+//
+// This function is safe for concurrent access.
+func (c *Client) failBatchRequests(err error) {
+	c.requestLock.Lock()
+	defer c.requestLock.Unlock()
+
+	c.batchLock.Lock()
+	defer c.batchLock.Unlock()
+
+	for e := c.batchList.Front(); e != nil; e = e.Next() {
+		req := e.Value.(*jsonRequest)
+
+		// Resolve all pending futures on the first batch-level failure
+		// so callers waiting on Receive don't block indefinitely.
+		// Safe: batch-mode responseChan buffers are unwritten here,
+		// so this send won't block while locks are held. Batch-mode
+		// requests only use addRequest (not sendPostRequest), so each
+		// responseChan buffer is still empty.
+		req.responseChan <- &Response{err: err}
+	}
+
+	c.requestMap = make(map[uint64]*list.Element)
+	c.batchList = list.New()
+
+	// Batch-mode requests are tracked in batchList, so requestList should
+	// already be empty. Keep this defensive reset for invariants and future
+	// call paths.
+	c.requestList.Init()
+}
+
 // Marshall's bulk requests and sends to the server
 // creates a response channel to receive the response
 func (c *Client) Send() error {
@@ -1726,12 +1814,7 @@ func (c *Client) Send() error {
 
 	batchResp, err := future.Receive()
 	if err != nil {
-		// Clear batchlist in case of an error.
-
-		c.batchLock.Lock()
-		c.batchList = list.New()
-		c.batchLock.Unlock()
-
+		c.failBatchRequests(err)
 		return err
 	}
 

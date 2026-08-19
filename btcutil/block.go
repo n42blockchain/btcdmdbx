@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 // OutOfRangeError describes an error due to accessing an element that is out
@@ -252,6 +252,9 @@ func NewBlockFromBytes(serializedBlock []byte) (*Block, error) {
 	b, err := NewBlockFromReader(br)
 	if err != nil {
 		return nil, err
+	}
+	if br.Len() > 0 {
+		return nil, fmt.Errorf("block has %d trailing bytes", br.Len())
 	}
 	b.serializedBlock = serializedBlock
 

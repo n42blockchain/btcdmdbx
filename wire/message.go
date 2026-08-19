@@ -10,7 +10,7 @@ import (
 	"io"
 	"unicode/utf8"
 
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/chainhash/v2"
 )
 
 // MessageHeaderSize is the number of bytes in a bitcoin message header.
@@ -570,6 +570,12 @@ func ReadV2MessageN(plaintext []byte, pver uint32, enc MessageEncoding) (
 		return nil, nil, err
 	}
 
+	if buf.Len() > 0 {
+		str := fmt.Sprintf("message payload has %d extra bytes "+
+			"after decode", buf.Len())
+		return nil, nil, messageError("ReadV2MessageN", str)
+	}
+
 	return msg, plaintext, nil
 }
 
@@ -689,6 +695,16 @@ func readMessageWithEncodingNInternal(r io.Reader, pver uint32,
 	err = msg.BtcDecode(pr, pver, enc)
 	if err != nil {
 		return totalBytes, nil, nil, err
+	}
+
+	// Reject messages where the payload was not fully consumed by
+	// BtcDecode. A peer could otherwise append arbitrary trailing bytes
+	// to an otherwise valid message, which would be silently accepted
+	// and persisted (e.g., in the block database).
+	if pr.Len() > 0 {
+		str := fmt.Sprintf("message payload has %d extra bytes "+
+			"after decode", pr.Len())
+		return totalBytes, nil, nil, messageError("ReadMessage", str)
 	}
 
 	return totalBytes, msg, payload, nil

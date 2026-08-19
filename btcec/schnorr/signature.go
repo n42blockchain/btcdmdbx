@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	ecdsa_schnorr "github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
 )
@@ -91,7 +91,10 @@ func ParseSignature(sig []byte) (*Signature, error) {
 		return nil, signatureError(ecdsa_schnorr.ErrSigRTooBig, str)
 	}
 	var s btcec.ModNScalar
-	s.SetByteSlice(sig[32:64])
+	if overflow := s.SetByteSlice(sig[32:64]); overflow {
+		str := "invalid signature: s >= group order"
+		return nil, signatureError(ecdsa_schnorr.ErrSigSTooBig, str)
+	}
 
 	// Return the signature.
 	return NewSignature(&r, &s), nil

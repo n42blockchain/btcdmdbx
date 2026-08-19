@@ -6,6 +6,7 @@ package rpctest
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,11 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/rpcclient"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 const (
@@ -75,7 +77,15 @@ var (
 
 	// lastPort is the last port determined to be free for use by a new
 	// node. It should be used atomically.
-	lastPort uint32 = defaultNodePort
+	//
+	// Seed with a random offset so concurrent `go test` processes
+	// (e.g. when integration/ and integration/rpctest/ run in parallel
+	// under `make unit`) do not race on the same port range. The
+	// bind-test in NextAvailablePort closes the listener before
+	// returning, leaving a window where another process could grab the
+	// same port; staggering each process's starting point avoids the
+	// collision. The 50k-port window leaves headroom below 65535.
+	lastPort uint32 = defaultNodePort + rand.Uint32N(50000)
 )
 
 // HarnessTestCase represents a test-case which utilizes an instance of the
@@ -256,7 +266,7 @@ func (h *Harness) SetUp(createTestChain bool, numMatureOutputs uint32) error {
 
 	// Filter transactions that pay to the coinbase associated with the
 	// wallet.
-	filterAddrs := []btcutil.Address{h.wallet.coinbaseAddr}
+	filterAddrs := []address.Address{h.wallet.coinbaseAddr}
 	if err := h.Client.LoadTxFilter(true, filterAddrs, nil); err != nil {
 		return err
 	}
@@ -387,7 +397,7 @@ func (h *Harness) connectRPCClient() error {
 // wallet.
 //
 // This function is safe for concurrent access.
-func (h *Harness) NewAddress() (btcutil.Address, error) {
+func (h *Harness) NewAddress() (address.Address, error) {
 	return h.wallet.NewAddress()
 }
 

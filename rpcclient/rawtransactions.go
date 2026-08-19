@@ -10,10 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcjson"
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 const (
@@ -292,7 +293,7 @@ func (r FutureCreateRawTransactionResult) Receive() (*wire.MsgTx, error) {
 //
 // See CreateRawTransaction for the blocking version and more details.
 func (c *Client) CreateRawTransactionAsync(inputs []btcjson.TransactionInput,
-	amounts map[btcutil.Address]btcutil.Amount, lockTime *int64) FutureCreateRawTransactionResult {
+	amounts map[address.Address]btcutil.Amount, lockTime *int64) FutureCreateRawTransactionResult {
 
 	convertedAmts := make(map[string]float64, len(amounts))
 	for addr, amount := range amounts {
@@ -306,7 +307,7 @@ func (c *Client) CreateRawTransactionAsync(inputs []btcjson.TransactionInput,
 // and sending to the provided addresses. If the inputs are either nil or an
 // empty slice, it is interpreted as an empty slice.
 func (c *Client) CreateRawTransaction(inputs []btcjson.TransactionInput,
-	amounts map[btcutil.Address]btcutil.Amount, lockTime *int64) (*wire.MsgTx, error) {
+	amounts map[address.Address]btcutil.Amount, lockTime *int64) (*wire.MsgTx, error) {
 
 	return c.CreateRawTransactionAsync(inputs, amounts, lockTime).Receive()
 }
@@ -771,7 +772,9 @@ func (r FutureSearchRawTransactionsResult) Receive() ([]*wire.MsgTx, error) {
 // function on the returned instance.
 //
 // See SearchRawTransactions for the blocking version and more details.
-func (c *Client) SearchRawTransactionsAsync(address btcutil.Address, skip, count int, reverse bool, filterAddrs []string) FutureSearchRawTransactionsResult {
+func (c *Client) SearchRawTransactionsAsync(address address.Address, skip,
+	count int, reverse bool, filterAddrs []string) FutureSearchRawTransactionsResult {
+
 	addr := address.EncodeAddress()
 	verbose := btcjson.Int(0)
 	cmd := btcjson.NewSearchRawTransactionsCmd(addr, verbose, &skip, &count,
@@ -786,7 +789,9 @@ func (c *Client) SearchRawTransactionsAsync(address btcutil.Address, skip, count
 //
 // See SearchRawTransactionsVerbose to retrieve a list of data structures with
 // information about the transactions instead of the transactions themselves.
-func (c *Client) SearchRawTransactions(address btcutil.Address, skip, count int, reverse bool, filterAddrs []string) ([]*wire.MsgTx, error) {
+func (c *Client) SearchRawTransactions(address address.Address, skip, count int,
+	reverse bool, filterAddrs []string) ([]*wire.MsgTx, error) {
+
 	return c.SearchRawTransactionsAsync(address, skip, count, reverse, filterAddrs).Receive()
 }
 
@@ -818,8 +823,9 @@ func (r FutureSearchRawTransactionsVerboseResult) Receive() ([]*btcjson.SearchRa
 // function on the returned instance.
 //
 // See SearchRawTransactionsVerbose for the blocking version and more details.
-func (c *Client) SearchRawTransactionsVerboseAsync(address btcutil.Address, skip,
-	count int, includePrevOut, reverse bool, filterAddrs *[]string) FutureSearchRawTransactionsVerboseResult {
+func (c *Client) SearchRawTransactionsVerboseAsync(address address.Address, skip,
+	count int, includePrevOut, reverse bool,
+	filterAddrs *[]string) FutureSearchRawTransactionsVerboseResult {
 
 	addr := address.EncodeAddress()
 	verbose := btcjson.Int(1)
@@ -839,8 +845,9 @@ func (c *Client) SearchRawTransactionsVerboseAsync(address btcutil.Address, skip
 // specifically been enabled.
 //
 // See SearchRawTransactions to retrieve a list of raw transactions instead.
-func (c *Client) SearchRawTransactionsVerbose(address btcutil.Address, skip,
-	count int, includePrevOut, reverse bool, filterAddrs []string) ([]*btcjson.SearchRawTransactionsResult, error) {
+func (c *Client) SearchRawTransactionsVerbose(address address.Address, skip,
+	count int, includePrevOut, reverse bool,
+	filterAddrs []string) ([]*btcjson.SearchRawTransactionsResult, error) {
 
 	return c.SearchRawTransactionsVerboseAsync(address, skip, count,
 		includePrevOut, reverse, &filterAddrs).Receive()
@@ -1013,6 +1020,110 @@ func (c *Client) TestMempoolAccept(txns []*wire.MsgTx,
 	maxFeeRate btcjson.BTCPerkvB) ([]*btcjson.TestMempoolAcceptResult, error) {
 
 	return c.TestMempoolAcceptAsync(txns, maxFeeRate).Receive()
+}
+
+// FutureSubmitPackageResult is a future promise to deliver the result of a
+// SubmitPackage RPC invocation (or an applicable error).
+type FutureSubmitPackageResult chan *Response
+
+// Receive waits for the Response promised by the future and returns the result
+// of submitting the package.
+func (r FutureSubmitPackageResult) Receive() (*btcjson.SubmitPackageResult,
+	error) {
+
+	response, err := ReceiveFuture(r)
+	if err != nil {
+		return nil, err
+	}
+
+	// btcjson.SubmitPackageResult implements a custom UnmarshalJSON that
+	// maps the raw submitpackage response into higher-level types.
+	var result btcjson.SubmitPackageResult
+	if err := json.Unmarshal(response, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// maxPackageTxns is the maximum number of transactions a single submitpackage
+// call may contain. It mirrors bitcoind's MAX_PACKAGE_COUNT (see
+// src/policy/packages.h), which caps a package at 25 transactions.
+const maxPackageTxns = 25
+
+// SubmitPackageAsync returns an instance of a type that can be used to get the
+// result of the RPC at some future time by invoking the Receive function on
+// the returned instance.
+//
+// See SubmitPackage for the blocking version and more details.
+func (c *Client) SubmitPackageAsync(txns []*wire.MsgTx,
+	maxFeeRate, maxBurnAmount *float64) FutureSubmitPackageResult {
+
+	// Gate on the backend version so an unsupported backend (btcd, or
+	// Bitcoin Core before v24) returns a typed ErrBackendVersion rather
+	// than a raw method-not-found error the caller would have to
+	// string-match. This mirrors TestMempoolAccept/GetTxSpendingPrevOut.
+	version, err := c.BackendVersion()
+	if err != nil {
+		return newFutureError(err)
+	}
+
+	if !version.SupportSubmitPackage() {
+		err := fmt.Errorf("%w: %v", ErrBackendVersion, version)
+
+		return newFutureError(err)
+	}
+
+	// A package must contain at least one transaction (the child) and at
+	// most maxPackageTxns.
+	if len(txns) == 0 {
+		err := fmt.Errorf("%w: no transactions provided",
+			ErrInvalidParam)
+
+		return newFutureError(err)
+	}
+
+	if len(txns) > maxPackageTxns {
+		err := fmt.Errorf("%w: too many transactions provided",
+			ErrInvalidParam)
+
+		return newFutureError(err)
+	}
+
+	// Serialize each transaction to a hex string, preserving the
+	// topological order (parents first, child last) the caller provides.
+	rawTxns := make([]string, 0, len(txns))
+	for _, tx := range txns {
+		buf := bytes.NewBuffer(make([]byte, 0, tx.SerializeSize()))
+		if err := tx.Serialize(buf); err != nil {
+			err = fmt.Errorf("%w: %v", ErrInvalidParam, err)
+
+			return newFutureError(err)
+		}
+
+		rawTxns = append(rawTxns, hex.EncodeToString(buf.Bytes()))
+	}
+
+	cmd := btcjson.NewJsonSubmitPackageCmd(
+		rawTxns, maxFeeRate, maxBurnAmount,
+	)
+
+	return c.SendCmd(cmd)
+}
+
+// SubmitPackage submits a package of related, topologically-sorted
+// transactions (unconfirmed parents first, child last) to the backend's
+// mempool for atomic validation and acceptance via the submitpackage RPC. It
+// lets a zero-fee v3/TRUC parent be accepted via its fee-paying CPFP child,
+// which a standalone broadcast would reject.
+//
+// maxFeeRate (BTC/kvB) and maxBurnAmount (BTC) are optional limits; a nil
+// value uses the backend's RPC default.
+func (c *Client) SubmitPackage(txns []*wire.MsgTx,
+	maxFeeRate, maxBurnAmount *float64) (*btcjson.SubmitPackageResult,
+	error) {
+
+	return c.SubmitPackageAsync(txns, maxFeeRate, maxBurnAmount).Receive()
 }
 
 // FutureGetTxSpendingPrevOut is a future promise to deliver the result of a

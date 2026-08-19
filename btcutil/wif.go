@@ -8,10 +8,11 @@ import (
 	"bytes"
 	"errors"
 
+	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcd/address/v2/base58"
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcutil/base58"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 )
 
 // ErrMalformedPrivateKey describes an error where a WIF-encoded private
@@ -112,11 +113,27 @@ func DecodeWIF(wif string) (*WIF, error) {
 	}
 	cksum := chainhash.DoubleHashB(tosum)[:4]
 	if !bytes.Equal(cksum, decoded[decodedLen-4:]) {
-		return nil, ErrChecksumMismatch
+		return nil, address.ErrChecksumMismatch
 	}
 
 	netID := decoded[0]
 	privKeyBytes := decoded[1 : 1+btcec.PrivKeyBytesLen]
+
+	// Ensure the private key is within the valid range for a secp256k1
+	// private key, that is [1, N-1].  Without this check, a WIF encoding a
+	// key of zero or one greater than or equal to the group order N is
+	// silently accepted: btcec.PrivKeyFromBytes reduces the scalar modulo
+	// N, so DecodeWIF would otherwise return a private key that differs from
+	// the one actually encoded in the WIF (or the all-zero key) without
+	// reporting an error.
+	var keyScalar btcec.ModNScalar
+	defer keyScalar.Zero()
+	if overflow := keyScalar.SetByteSlice(privKeyBytes); overflow ||
+		keyScalar.IsZero() {
+
+		return nil, ErrMalformedPrivateKey
+	}
+
 	privKey, _ := btcec.PrivKeyFromBytes(privKeyBytes)
 	return &WIF{privKey, compress, netID}, nil
 }

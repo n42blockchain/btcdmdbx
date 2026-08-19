@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"golang.org/x/crypto/ripemd160"
 )
 
@@ -50,6 +50,9 @@ const (
 
 	// witnessV1TaprootLen is the length of a P2TR script.
 	witnessV1TaprootLen = 34
+
+	// payToAnchorLen is the length of a P2A script.
+	payToAnchorLen = 4
 
 	// maxLen is the maximum script length supported by ParsePkScript.
 	maxLen = witnessV0ScriptHashLen
@@ -103,7 +106,7 @@ func ParsePkScript(pkScript []byte) (PkScript, error) {
 func isSupportedScriptType(class ScriptClass) bool {
 	switch class {
 	case PubKeyHashTy, WitnessV0PubKeyHashTy, ScriptHashTy,
-		WitnessV0ScriptHashTy, WitnessV1TaprootTy:
+		WitnessV0ScriptHashTy, WitnessV1TaprootTy, PayToAnchorTy:
 		return true
 	default:
 		return false
@@ -140,6 +143,10 @@ func (s PkScript) Script() []byte {
 		script = make([]byte, witnessV1TaprootLen)
 		copy(script, s.script[:witnessV1TaprootLen])
 
+	case PayToAnchorTy:
+		script = make([]byte, payToAnchorLen)
+		copy(script, s.script[:payToAnchorLen])
+
 	default:
 		// Unsupported script type.
 		return nil
@@ -149,10 +156,14 @@ func (s PkScript) Script() []byte {
 }
 
 // Address encodes the script into an address for the given chain.
-func (s PkScript) Address(chainParams *chaincfg.Params) (btcutil.Address, error) {
+func (s PkScript) Address(chainParams *chaincfg.Params) (address.Address, error) {
 	_, addrs, _, err := ExtractPkScriptAddrs(s.Script(), chainParams)
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse address: %v", err)
+	}
+
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("script does not have an associated address")
 	}
 
 	return addrs[0], nil

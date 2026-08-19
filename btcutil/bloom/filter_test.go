@@ -9,10 +9,11 @@ import (
 	"encoding/hex"
 	"testing"
 
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/btcutil/bloom"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/btcutil/v2/bloom"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 // TestFilterLarge ensures a maximum sized filter can be created.
@@ -255,7 +256,7 @@ func TestFilterInsertKey(t *testing.T) {
 
 	f := bloom.NewFilter(2, 0, 0.001, wire.BloomUpdateAll)
 	f.Add(wif.SerializePubKey())
-	f.Add(btcutil.Hash160(wif.SerializePubKey()))
+	f.Add(address.Hash160(wif.SerializePubKey()))
 
 	want, err := hex.DecodeString("038fc16b080000000000000001")
 	if err != nil {
@@ -324,7 +325,7 @@ func TestFilterBloomMatch(t *testing.T) {
 		0x02, 0x00, 0x00, 0x00, 0x00, 0x19, 0x76, 0xa9, 0x14,
 		0xc1, 0x09, 0x32, 0x48, 0x3f, 0xec, 0x93, 0xed, 0x51,
 		0xf5, 0xfe, 0x95, 0xe7, 0x25, 0x59, 0xf2, 0xcc, 0x70,
-		0x43, 0xf9, 0x88, 0xac, 0x00, 0x00, 0x00, 0x00, 0x00}
+		0x43, 0xf9, 0x88, 0xac, 0x00, 0x00, 0x00, 0x00}
 
 	spendingTx, err := btcutil.NewTxFromBytes(spendingTxBytes)
 	if err != nil {

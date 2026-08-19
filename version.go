@@ -11,14 +11,14 @@ import (
 )
 
 // semanticAlphabet
-const semanticAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
+const semanticAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-."
 
 // These constants define the application version and follow the semantic
 // versioning 2.0.0 spec (http://semver.org/).
 const (
 	appMajor uint = 0
-	appMinor uint = 25
-	appPatch uint = 0
+	appMinor uint = 26
+	appPatch uint = 2
 
 	// appPreRelease MUST only contain characters from semanticAlphabet
 	// per the semantic versioning spec.
