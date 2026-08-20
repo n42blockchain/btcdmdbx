@@ -59,6 +59,24 @@ type config struct {
 	utxoCache  int
 	workers    int
 	depth      int
+	logPath    string
+	loadOnly   bool
+}
+
+// logOut is where progress is written, in addition to standard output.
+var logOut *os.File
+
+// logf writes a progress line and flushes it.
+//
+// Standard output is buffered when the process is launched with its output
+// redirected, which leaves a long run looking hung. Writing to an explicit
+// file and syncing after every line keeps progress observable.
+func logf(format string, args ...interface{}) {
+	fmt.Printf(format, args...)
+	if logOut != nil {
+		fmt.Fprintf(logOut, format, args...)
+		logOut.Sync()
+	}
 }
 
 func main() {
@@ -87,6 +105,11 @@ func parseFlags() *config {
 			"measures signature verification rather than storage")
 	flag.StringVar(&cfg.cpuProfile, "cpuprofile", "",
 		"write a CPU profile to this path")
+	flag.BoolVar(&cfg.loadOnly, "loadonly", false,
+		"open the database, load the chain state, report how long it "+
+			"took, and exit")
+	flag.StringVar(&cfg.logPath, "log", "",
+		"also write progress to this file, flushed after every line")
 	flag.IntVar(&cfg.workers, "workers", runtime.NumCPU()/4,
 		"goroutines deserializing blocks ahead of the connect loop")
 	flag.IntVar(&cfg.depth, "depth", 1024,
@@ -187,6 +210,72 @@ func (r *blockFileReader) next() ([]byte, error) {
 
 		return block, nil
 	}
+}
+
+// skip advances past n records without decoding them.
+//
+// Resuming an interrupted replay has to reach the point the previous run
+// stopped at. Reading every record to get there means re-reading the entire
+// block corpus -- hundreds of gigabytes -- to skip work already done. Only the
+// eight-byte header of each record is needed to find the next one, so the body
+// and checksum are seeked over instead.
+//
+// The count is approximate by design: it comes from the resumed chain height,
+// while the files also hold orphans and side-chain blocks. Skipping slightly
+// too few is harmless because the duplicates are recognised and skipped by the
+// caller; skipping too many is prevented by never skipping past the count
+// given.
+func (r *blockFileReader) skip(n int) (int, error) {
+	skipped := 0
+	for skipped < n {
+		if r.file == nil {
+			if r.fileIdx >= len(r.paths) {
+				return skipped, nil
+			}
+			file, err := os.Open(r.paths[r.fileIdx])
+			if err != nil {
+				return skipped, err
+			}
+			r.file = file
+			r.fileIdx++
+		}
+
+		var header [8]byte
+		_, err := io.ReadFull(r.file, header[:])
+		if err != nil {
+			r.file.Close()
+			r.file = nil
+
+			continue
+		}
+
+		net := binary.LittleEndian.Uint32(header[0:4])
+		if net == 0 {
+			r.file.Close()
+			r.file = nil
+
+			continue
+		}
+		if net != uint32(r.net) {
+			return skipped, fmt.Errorf("network mismatch: got "+
+				"%08x, want %08x", net, uint32(r.net))
+		}
+
+		blockLen := binary.LittleEndian.Uint32(header[4:8])
+		if blockLen > wire.MaxBlockPayload {
+			return skipped, fmt.Errorf("block of %d bytes exceeds "+
+				"the maximum of %d", blockLen,
+				wire.MaxBlockPayload)
+		}
+
+		// Step over the block body and its checksum.
+		if _, err := r.file.Seek(int64(blockLen)+4, io.SeekCurrent); err != nil {
+			return skipped, err
+		}
+		skipped++
+	}
+
+	return skipped, nil
 }
 
 // readRecord reads one block record from the current file.
@@ -397,6 +486,15 @@ func run(cfg *config) error {
 		defer pprof.StopCPUProfile()
 	}
 
+	if cfg.logPath != "" {
+		f, err := os.Create(cfg.logPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		logOut = f
+	}
+
 	params := &chaincfg.MainNetParams
 
 	reader, err := newBlockFileReader(cfg.src, params.Net)
@@ -404,9 +502,15 @@ func run(cfg *config) error {
 		return err
 	}
 
-	db, err := database.Create("ffldb", cfg.dst, params.Net)
+	// Reuse an existing database when there is one.  A full mainnet replay
+	// runs for hours, and losing it to a crash or an interrupt near the end
+	// is worse than the small cost of checking.
+	db, err := database.Open("ffldb", cfg.dst, params.Net)
 	if err != nil {
-		return fmt.Errorf("failed to create database: %w", err)
+		db, err = database.Create("ffldb", cfg.dst, params.Net)
+		if err != nil {
+			return fmt.Errorf("failed to create database: %w", err)
+		}
 	}
 	closed := false
 	defer func() {
@@ -415,6 +519,7 @@ func run(cfg *config) error {
 		}
 	}()
 
+	openStart := time.Now()
 	chain, err := blockchain.New(&blockchain.Config{
 		DB:               db,
 		ChainParams:      params,
@@ -423,6 +528,14 @@ func run(cfg *config) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create chain: %w", err)
+	}
+
+	if cfg.loadOnly {
+		logf("chain state loaded to height %d in %s\n",
+			chain.BestSnapshot().Height,
+			time.Since(openStart).Truncate(time.Millisecond))
+
+		return nil
 	}
 
 	flags := blockchain.BFNone
@@ -438,8 +551,21 @@ func run(cfg *config) error {
 	fmt.Printf("building     %s\n", cfg.dst)
 	fmt.Printf("mode         %s\n", mode)
 	fmt.Printf("utxo cache   %d MiB\n", cfg.utxoCache)
-	fmt.Printf("pipeline     %d parse workers, depth %d\n\n",
+	fmt.Printf("pipeline     %d parse workers, depth %d\n",
 		cfg.workers, cfg.depth)
+	if resumeHeight := chain.BestSnapshot().Height; resumeHeight > 0 {
+		logf("resuming     from height %d, seeking past records\n",
+			resumeHeight)
+
+		skipStart := time.Now()
+		skipped, err := reader.skip(int(resumeHeight))
+		if err != nil {
+			return fmt.Errorf("failed to skip records: %w", err)
+		}
+		logf("             skipped %d records in %s\n", skipped,
+			time.Since(skipStart).Truncate(time.Second))
+	}
+	fmt.Printf("\n")
 
 	metadataPath := filepath.Join(cfg.dst, "metadata")
 	start := time.Now()
@@ -484,6 +610,17 @@ func run(cfg *config) error {
 		_, isOrphan, err := chain.ProcessBlock(block, flags)
 		processTime += time.Since(stageStart)
 		if err != nil {
+			// A block the chain already has means this run is
+			// resuming over ground the previous one covered.
+			var ruleErr blockchain.RuleError
+			if errors.As(err, &ruleErr) &&
+				ruleErr.ErrorCode == blockchain.ErrDuplicateBlock {
+
+				skipped++
+
+				continue
+			}
+
 			return fmt.Errorf("failed to process block %s at "+
 				"height %d: %w", block.Hash(),
 				chain.BestSnapshot().Height+1, err)
@@ -500,7 +637,7 @@ func run(cfg *config) error {
 			rate := float64(processed-lastProcessed) / elapsed
 			meta := dirSize(metadataPath)
 
-			fmt.Printf("height %7d  %7.1f blocks/s  "+
+			logf("height %7d  %7.1f blocks/s  "+
 				"metadata %8.2f GB  elapsed %s\n",
 				best.Height, rate,
 				float64(meta)/(1<<30),
