@@ -520,9 +520,24 @@ func run(cfg *config) error {
 	best := chain.BestSnapshot()
 	elapsed := time.Since(start)
 
-	// Close before measuring.  The cache holds pending metadata in
-	// memory up to its size threshold, so measuring while the database
-	// is open reports a fraction of the real footprint.
+	// Flush the UTXO cache before anything is measured.
+	//
+	// The cache holds the live UTXO set in memory up to its configured
+	// size and only spills to the database when it fills.  Closing the
+	// database does not write it out -- that flushes the metadata cache,
+	// which is a different layer.  Skipping this leaves the store holding
+	// the block index and the undo journal but almost none of the UTXO
+	// set, which both understates the footprint and leaves a chainstate
+	// that could not be resumed.
+	flushStart := time.Now()
+	if err := chain.FlushUtxoCache(blockchain.FlushRequired); err != nil {
+		return fmt.Errorf("failed to flush utxo cache: %w", err)
+	}
+	flushTime := time.Since(flushStart)
+
+	// Close before measuring.  The metadata cache holds pending writes in
+	// memory up to its size threshold, so measuring while the database is
+	// open reports a fraction of the real footprint.
 	if err := db.Close(); err != nil {
 		return fmt.Errorf("failed to close database: %w", err)
 	}
@@ -535,6 +550,7 @@ func run(cfg *config) error {
 	fmt.Printf("  height           %d\n", best.Height)
 	fmt.Printf("  blocks replayed  %d (%d skipped)\n", processed, skipped)
 	fmt.Printf("  elapsed          %s\n", elapsed.Truncate(time.Second))
+	fmt.Printf("  utxo flush       %s\n", flushTime.Truncate(time.Second))
 	fmt.Printf("  average rate     %.1f blocks/s\n",
 		float64(processed)/elapsed.Seconds())
 	fmt.Printf("  metadata size    %.3f GB\n", float64(meta)/(1<<30))
