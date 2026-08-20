@@ -6,9 +6,17 @@
 // self-describing, so an existing node's block files can be replayed into a
 // fresh database and the resulting throughput and metadata size recorded.
 //
-// The source files are only ever read. The blocks are validated in full by the
-// same code path a syncing node uses, so the resulting chainstate is the one a
-// node would have built for itself.
+// The source files are only ever read.
+//
+// Blocks are replayed with the same fast-add behaviour a node uses below its
+// last checkpoint, which skips checkConnectBlock: signature verification, the
+// spend checks and the BIP30 scan. Everything the storage layer does still
+// happens, since the block is written and the UTXO set updated either way.
+// That is deliberate. Validating every block in full turns the run into a
+// measurement of ECDSA throughput -- on this data it fell from 2,190 to under
+// 4 blocks per second by height 387,000 while the store was writing well under
+// a megabyte a second -- and the storage layer never becomes the bottleneck.
+// Pass --fastadd=false to measure validation instead.
 package main
 
 import (
@@ -64,9 +72,11 @@ func parseFlags() *config {
 		"stop after this height (0 replays everything available)")
 	flag.IntVar(&cfg.reportSecs, "report", 30,
 		"seconds between progress reports")
-	flag.BoolVar(&cfg.fastAdd, "fastadd", false,
+	flag.BoolVar(&cfg.fastAdd, "fastadd", true,
 		"skip the checks a checkpointed block does not need, which is "+
-			"what a syncing node does below its last checkpoint")
+			"what a syncing node does below its last checkpoint. Pass "+
+			"--fastadd=false to validate every block in full, which "+
+			"measures signature verification rather than storage")
 	flag.Parse()
 
 	return cfg
@@ -240,8 +250,13 @@ func run(cfg *config) error {
 		flags = blockchain.BFFastAdd
 	}
 
+	mode := "fast-add (checkpoint behaviour, storage-bound)"
+	if !cfg.fastAdd {
+		mode = "full validation (signature-bound)"
+	}
 	fmt.Printf("replaying from %s\n", cfg.src)
-	fmt.Printf("building     %s\n\n", cfg.dst)
+	fmt.Printf("building     %s\n", cfg.dst)
+	fmt.Printf("mode         %s\n\n", mode)
 
 	metadataPath := filepath.Join(cfg.dst, "metadata")
 	start := time.Now()
