@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -23,109 +25,81 @@ type txValidateItem struct {
 	sigHashes *txscript.TxSigHashes
 }
 
-// txValidator provides a type which asynchronously validates transaction
-// inputs.  It provides several channels for communication and a processing
-// function that is intended to be in run multiple goroutines.
+// txValidator provides a type which validates transaction inputs across a
+// pool of goroutines.
 type txValidator struct {
-	validateChan chan *txValidateItem
-	quitChan     chan struct{}
-	resultChan   chan error
-	utxoView     *UtxoViewpoint
-	flags        txscript.ScriptFlags
-	sigCache     *txscript.SigCache
-	hashCache    *txscript.HashCache
+	utxoView  *UtxoViewpoint
+	flags     txscript.ScriptFlags
+	sigCache  *txscript.SigCache
+	hashCache *txscript.HashCache
 }
 
-// sendResult sends the result of a script pair validation on the internal
-// result channel while respecting the quit channel.  This allows orderly
-// shutdown when the validation process is aborted early due to a validation
-// error in one of the other goroutines.
-func (v *txValidator) sendResult(result error) {
-	select {
-	case v.resultChan <- result:
-	case <-v.quitChan:
+// validateItem validates a single transaction input.
+func (v *txValidator) validateItem(txVI *txValidateItem) error {
+	// Ensure the referenced input utxo is available.
+	txIn := txVI.txIn
+	utxo := v.utxoView.LookupEntry(txIn.PreviousOutPoint)
+	if utxo == nil {
+		str := fmt.Sprintf("unable to find unspent "+
+			"output %v referenced from "+
+			"transaction %s:%d",
+			txIn.PreviousOutPoint, txVI.tx.Hash(),
+			txVI.txInIndex)
+		return ruleError(ErrMissingTxOut, str)
 	}
-}
 
-// validateHandler consumes items to validate from the internal validate channel
-// and returns the result of the validation on the internal result channel. It
-// must be run as a goroutine.
-func (v *txValidator) validateHandler() {
-out:
-	for {
-		select {
-		case txVI := <-v.validateChan:
-			// Ensure the referenced input utxo is available.
-			txIn := txVI.txIn
-			utxo := v.utxoView.LookupEntry(txIn.PreviousOutPoint)
-			if utxo == nil {
-				str := fmt.Sprintf("unable to find unspent "+
-					"output %v referenced from "+
-					"transaction %s:%d",
-					txIn.PreviousOutPoint, txVI.tx.Hash(),
-					txVI.txInIndex)
-				err := ruleError(ErrMissingTxOut, str)
-				v.sendResult(err)
-				break out
-			}
-
-			// Create a new script engine for the script pair.
-			sigScript := txIn.SignatureScript
-			witness := txIn.Witness
-			pkScript := utxo.PkScript()
-			inputAmount := utxo.Amount()
-			vm, err := txscript.NewEngine(
-				pkScript, txVI.tx.MsgTx(), txVI.txInIndex,
-				v.flags, v.sigCache, txVI.sigHashes,
-				inputAmount, v.utxoView,
-			)
-			if err != nil {
-				str := fmt.Sprintf("failed to parse input "+
-					"%s:%d which references output %v - "+
-					"%v (input witness %x, input script "+
-					"bytes %x, prev output script bytes %x)",
-					txVI.tx.Hash(), txVI.txInIndex,
-					txIn.PreviousOutPoint, err, witness,
-					sigScript, pkScript)
-				err := ruleError(ErrScriptMalformed, str)
-				v.sendResult(err)
-				break out
-			}
-
-			// Execute the script pair.
-			if err := vm.Execute(); err != nil {
-				str := fmt.Sprintf("failed to validate input "+
-					"%s:%d which references output %v - "+
-					"%v (input witness %x, input script "+
-					"bytes %x, prev output script bytes %x)",
-					txVI.tx.Hash(), txVI.txInIndex,
-					txIn.PreviousOutPoint, err, witness,
-					sigScript, pkScript)
-				err := ruleError(ErrScriptValidation, str)
-				v.sendResult(err)
-				break out
-			}
-
-			// Validation succeeded.
-			v.sendResult(nil)
-
-		case <-v.quitChan:
-			break out
-		}
+	// Create a new script engine for the script pair.
+	sigScript := txIn.SignatureScript
+	witness := txIn.Witness
+	pkScript := utxo.PkScript()
+	inputAmount := utxo.Amount()
+	vm, err := txscript.NewEngine(
+		pkScript, txVI.tx.MsgTx(), txVI.txInIndex,
+		v.flags, v.sigCache, txVI.sigHashes,
+		inputAmount, v.utxoView,
+	)
+	if err != nil {
+		str := fmt.Sprintf("failed to parse input "+
+			"%s:%d which references output %v - "+
+			"%v (input witness %x, input script "+
+			"bytes %x, prev output script bytes %x)",
+			txVI.tx.Hash(), txVI.txInIndex,
+			txIn.PreviousOutPoint, err, witness,
+			sigScript, pkScript)
+		return ruleError(ErrScriptMalformed, str)
 	}
+
+	// Execute the script pair.
+	if err := vm.Execute(); err != nil {
+		str := fmt.Sprintf("failed to validate input "+
+			"%s:%d which references output %v - "+
+			"%v (input witness %x, input script "+
+			"bytes %x, prev output script bytes %x)",
+			txVI.tx.Hash(), txVI.txInIndex,
+			txIn.PreviousOutPoint, err, witness,
+			sigScript, pkScript)
+		return ruleError(ErrScriptValidation, str)
+	}
+
+	return nil
 }
 
-// Validate validates the scripts for all of the passed transaction inputs using
-// multiple goroutines.
+// Validate validates the scripts for all of the passed transaction inputs
+// using multiple goroutines.
+//
+// Items are handed out through an atomic counter rather than channels.  The
+// historical design pushed every item and every result through unbuffered
+// channels between a dispatcher and NumCPU*3 workers, costing two cross
+// thread wakeups per input; on signature-dense blocks the scheduler churn
+// from those wakeups was a measurable fraction of total validation time.
+// Claiming work with one atomic add removes the churn, and with no channel
+// blocking to hide there is no reason to oversubscribe the CPUs either.
 func (v *txValidator) Validate(items []*txValidateItem) error {
 	if len(items) == 0 {
 		return nil
 	}
 
-	// Limit the number of goroutines to do script validation based on the
-	// number of processor cores.  This helps ensure the system stays
-	// reasonably responsive under heavy load.
-	maxGoRoutines := runtime.NumCPU() * 3
+	maxGoRoutines := runtime.NumCPU()
 	if maxGoRoutines <= 0 {
 		maxGoRoutines = 1
 	}
@@ -133,43 +107,41 @@ func (v *txValidator) Validate(items []*txValidateItem) error {
 		maxGoRoutines = len(items)
 	}
 
-	// Start up validation handlers that are used to asynchronously
-	// validate each transaction input.
-	for i := 0; i < maxGoRoutines; i++ {
-		go v.validateHandler()
-	}
+	// A validation failure parks the counter past the end of the items,
+	// so every worker stops claiming work at its next iteration.  Items
+	// already in flight run to completion, exactly as before.
+	var next atomic.Uint64
+	errs := make([]error, maxGoRoutines)
 
-	// Validate each of the inputs.  The quit channel is closed when any
-	// errors occur so all processing goroutines exit regardless of which
-	// input had the validation error.
-	numInputs := len(items)
-	currentItem := 0
-	processedItems := 0
-	for processedItems < numInputs {
-		// Only send items while there are still items that need to
-		// be processed.  The select statement will never select a nil
-		// channel.
-		var validateChan chan *txValidateItem
-		var item *txValidateItem
-		if currentItem < numInputs {
-			validateChan = v.validateChan
-			item = items[currentItem]
-		}
+	var wg sync.WaitGroup
+	for w := 0; w < maxGoRoutines; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
 
-		select {
-		case validateChan <- item:
-			currentItem++
+			for {
+				i := next.Add(1) - 1
+				if i >= uint64(len(items)) {
+					return
+				}
 
-		case err := <-v.resultChan:
-			processedItems++
-			if err != nil {
-				close(v.quitChan)
-				return err
+				if err := v.validateItem(items[i]); err != nil {
+					errs[w] = err
+					next.Store(uint64(len(items)))
+
+					return
+				}
 			}
+		}(w)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 
-	close(v.quitChan)
 	return nil
 }
 
@@ -178,13 +150,10 @@ func (v *txValidator) Validate(items []*txValidateItem) error {
 func newTxValidator(utxoView *UtxoViewpoint, flags txscript.ScriptFlags,
 	sigCache *txscript.SigCache, hashCache *txscript.HashCache) *txValidator {
 	return &txValidator{
-		validateChan: make(chan *txValidateItem),
-		quitChan:     make(chan struct{}),
-		resultChan:   make(chan error),
-		utxoView:     utxoView,
-		sigCache:     sigCache,
-		hashCache:    hashCache,
-		flags:        flags,
+		utxoView:  utxoView,
+		sigCache:  sigCache,
+		hashCache: hashCache,
+		flags:     flags,
 	}
 }
 
