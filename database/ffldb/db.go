@@ -20,19 +20,30 @@ import (
 	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/database/internal/treap"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/bloom"
+	"github.com/erigontech/mdbx-go/mdbx"
 )
 
 const (
 	// metadataDbName is the name used for the metadata database.
 	metadataDbName = "metadata"
 
-	// numMetadataLevels is how many LSM levels the metadata store is
-	// configured with.  Seven is the engine default; it is named here
-	// only because the per-level compression and filter settings have to
-	// be applied to each one explicitly.
-	numMetadataLevels = 7
+	// metadataTable is the single named table every metadata key lives
+	// in.  Buckets are virtualized through key prefixes, so one table is
+	// all the store needs.
+	metadataTable = "metadata"
+
+	// metadataMapUpper caps how large the metadata store may grow.  The
+	// engine requires this up front and cannot exceed it without
+	// reopening, so it is set well above what a mainnet chainstate
+	// needs; the file only occupies what it actually uses.
+	metadataMapUpper = 2 * 1024 * 1024 * 1024 * 1024
+
+	// metadataGrowthStep is how much the map grows once the current size
+	// is exhausted.
+	metadataGrowthStep = 1024 * 1024 * 1024
+
+	// metadataPageSize is the page size the store is created with.
+	metadataPageSize = 8192
 
 	// blockHdrSize is the size of a block header.  This is simply the
 	// constant from wire and is only provided here for convenience since
@@ -143,13 +154,14 @@ func convertErr(desc string, engineErr error) database.Error {
 
 	switch {
 	// Database corruption errors.
-	case errors.Is(engineErr, pebble.ErrCorruption):
+	case errors.Is(engineErr, mdbx.Corrupted),
+		errors.Is(engineErr, mdbx.VersionMismatch),
+		errors.Is(engineErr, mdbx.Invalid):
 		code = database.ErrCorruption
 
-	// Database open/create errors.  The engine reports use of a closed
-	// store, a closed snapshot, and a closed iterator all as ErrClosed,
-	// so unlike the previous engine they cannot be told apart here.
-	case errors.Is(engineErr, pebble.ErrClosed):
+	// Use of a store that is closed or was never opened.
+	case errors.Is(engineErr, errStoreClosed),
+		errors.Is(engineErr, mdbx.BadTxn):
 		code = database.ErrDbNotOpen
 	}
 
@@ -2126,16 +2138,16 @@ func fileExists(name string) bool {
 
 // initDB creates the initial buckets and values used by the package.  This is
 // mainly in a separate function for testing purposes.
-func initDB(metaDB *pebble.DB) (err error) {
-	defer recoverClosed(&err)
-
+func initDB(env *mdbx.Env, dbi mdbx.DBI) error {
 	// The starting block file write cursor location is file num 0, offset
 	// 0.
-	batch := metaDB.NewBatch()
-	defer batch.Close()
+	tx, err := env.BeginTxn(nil, 0)
+	if err != nil {
+		return convertErr("failed to open metadata transaction", err)
+	}
 
-	batch.Set(bucketizedKey(metadataBucketID, writeLocKeyName),
-		serializeWriteRow(0, 0), nil)
+	tx.Put(dbi, bucketizedKey(metadataBucketID, writeLocKeyName),
+		serializeWriteRow(0, 0), 0)
 
 	// Create block index bucket and set the current bucket id.
 	//
@@ -2143,12 +2155,12 @@ func initDB(metaDB *pebble.DB) (err error) {
 	// there is no need to store the bucket index data for the metadata
 	// bucket in the database.  However, the first bucket ID to use does
 	// need to account for it to ensure there are no key collisions.
-	batch.Set(bucketIndexKey(metadataBucketID, blockIdxBucketName),
-		blockIdxBucketID[:], nil)
-	batch.Set(curBucketIDKeyName, blockIdxBucketID[:], nil)
+	tx.Put(dbi, bucketIndexKey(metadataBucketID, blockIdxBucketName),
+		blockIdxBucketID[:], 0)
+	tx.Put(dbi, curBucketIDKeyName, blockIdxBucketID[:], 0)
 
-	// Write everything as a single durable batch.
-	if commitErr := batch.Commit(pebble.Sync); commitErr != nil {
+	// Write everything as a single durable transaction.
+	if _, commitErr := tx.Commit(); commitErr != nil {
 		str := fmt.Sprintf("failed to initialize metadata database: %v",
 			commitErr)
 		return convertErr(str, commitErr)
@@ -2176,24 +2188,9 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 	}
 
 	// Open the metadata database (will create it if needed).
-	//
-	// Compression stays off and the bloom filter keeps its ten bits per
-	// key so the stored bytes and the lookup behaviour match what this
-	// package has always produced.  The engine wants those set per level
-	// rather than globally.
-	opts := &pebble.Options{
-		ErrorIfExists: create,
-	}
-	opts.Levels = make([]pebble.LevelOptions, numMetadataLevels)
-	for i := range opts.Levels {
-		opts.Levels[i].Compression = pebble.NoCompression
-		opts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
-		opts.Levels[i].FilterType = pebble.TableFilter
-	}
-
-	metaDB, err := pebble.Open(metadataDbPath, opts)
+	env, dbi, err := openMetadataStore(metadataDbPath)
 	if err != nil {
-		return nil, convertErr(err.Error(), err)
+		return nil, err
 	}
 
 	// Create the block store which includes scanning the existing flat
@@ -2205,7 +2202,8 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 	if err != nil {
 		return nil, convertErr(err.Error(), err)
 	}
-	cache := newDbCache(metaDB, store, defaultCacheSize, defaultFlushSecs)
+	cache := newDbCache(env, dbi, store, defaultCacheSize,
+		defaultFlushSecs)
 	pdb := &db{store: store, cache: cache}
 
 	// Perform any reconciliation needed between the block and metadata as

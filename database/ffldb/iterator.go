@@ -440,3 +440,12 @@ func (m *mergedIterator) recordErr(iter dbIterator) {
 		m.err = iter.Error()
 	}
 }
+
+// compareKeys orders two keys the way the metadata store does.
+//
+// The store's keys are ordered lexicographically by unsigned byte value, which
+// is what both the engine and the pending-keys treap use, so the comparison is
+// kept in one place rather than being open-coded per iterator.
+func compareKeys(a, b []byte) int {
+	return bytes.Compare(a, b)
+}

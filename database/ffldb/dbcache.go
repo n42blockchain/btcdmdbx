@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/database/internal/treap"
-	"github.com/cockroachdb/pebble"
+	"github.com/erigontech/mdbx-go/mdbx"
 )
 
 const (
@@ -270,8 +270,16 @@ func (iter *dbCacheIterator) Error() error {
 
 // dbCacheSnapshot defines a snapshot of the database cache and underlying
 // database at a particular point in time.
+// dbCacheSnapshot holds a read transaction against the store plus the
+// cached keys as of the moment it was taken.
+//
+// The read transaction is what gives the snapshot its consistent view.  It
+// must be released promptly: the engine cannot reclaim pages that any open
+// read transaction might still reach, so a forgotten snapshot shows up as
+// unbounded file growth rather than as an error.
 type dbCacheSnapshot struct {
-	dbSnapshot    *pebble.Snapshot
+	dbTx          *mdbx.Txn
+	dbi           mdbx.DBI
 	pendingKeys   *treap.Immutable
 	pendingRemove *treap.Immutable
 }
@@ -287,8 +295,8 @@ func (snap *dbCacheSnapshot) Has(key []byte) bool {
 	}
 
 	// Consult the database.
-	value, err := pebbleGet(snap.dbSnapshot, key)
-	return err == nil && value != nil
+	_, err := snap.dbTx.Get(snap.dbi, key)
+	return err == nil
 }
 
 // Get returns the value for the passed key.  The function will return nil when
@@ -302,8 +310,10 @@ func (snap *dbCacheSnapshot) Get(key []byte) []byte {
 		return value
 	}
 
-	// Consult the database.
-	value, err := pebbleGet(snap.dbSnapshot, key)
+	// Consult the database.  The returned bytes belong to the read
+	// transaction and stay valid for as long as it does, which outlives
+	// every caller here, so no copy is needed.
+	value, err := snap.dbTx.Get(snap.dbi, key)
 	if err != nil {
 		return nil
 	}
@@ -312,7 +322,7 @@ func (snap *dbCacheSnapshot) Get(key []byte) []byte {
 
 // Release releases the snapshot.
 func (snap *dbCacheSnapshot) Release() {
-	snap.dbSnapshot.Close()
+	snap.dbTx.Abort()
 	snap.pendingKeys = nil
 	snap.pendingRemove = nil
 }
@@ -325,10 +335,10 @@ func (snap *dbCacheSnapshot) Release() {
 // The start key is inclusive and the limit key is exclusive.  Either or both
 // can be nil if the functionality is not desired.
 func (snap *dbCacheSnapshot) NewIterator(r *keyRange) *dbCacheIterator {
-	iter, err := snap.dbSnapshot.NewIter(iterOptions(r))
+	cursor, err := snap.dbTx.OpenCursor(snap.dbi)
 
 	return &dbCacheIterator{
-		dbIter:        newPebbleIterator(iter, err),
+		dbIter:        newMDBXIterator(cursor, r, err),
 		cacheIter:     newCacheTreapIter(snap, r),
 		cacheSnapshot: snap,
 	}
@@ -342,8 +352,10 @@ func (snap *dbCacheSnapshot) NewIterator(r *keyRange) *dbCacheIterator {
 // can commit transactions at will without incurring large performance hits due
 // to frequent disk syncs.
 type dbCache struct {
-	// metaDB is the underlying key/value store holding the metadata.
-	metaDB *pebble.DB
+	// env is the underlying key/value store holding the metadata, and dbi
+	// the single table within it that everything is namespaced into.
+	env *mdbx.Env
+	dbi mdbx.DBI
 
 	// store is used to sync blocks to flat files.
 	store *blockStore
@@ -377,23 +389,36 @@ type dbCache struct {
 	cacheLock    sync.RWMutex
 	cachedKeys   *treap.Immutable
 	cachedRemove *treap.Immutable
+
+	// closed records that the store has been closed.  Calls into the
+	// engine after that point are undefined rather than erroring, so they
+	// are refused here instead.
+	//
+	// NOTE: protected by the database write lock, like the flush fields.
+	closed bool
 }
 
 // Snapshot returns a snapshot of the database cache and underlying database at
 // a particular point in time.
 //
 // The snapshot must be released after use by calling Release.
-func (c *dbCache) Snapshot() (snapshot *dbCacheSnapshot, err error) {
-	defer recoverClosed(&err)
+func (c *dbCache) Snapshot() (*dbCacheSnapshot, error) {
+	if err := c.checkClosed(); err != nil {
+		return nil, err
+	}
 
-	dbSnapshot := c.metaDB.NewSnapshot()
+	dbTx, txErr := c.env.BeginTxn(nil, mdbx.Readonly)
+	if txErr != nil {
+		return nil, convertErr("failed to open metadata snapshot", txErr)
+	}
 
 	// Since the cached keys to be added and removed use an immutable treap,
 	// a snapshot is simply obtaining the root of the tree under the lock
 	// which is used to atomically swap the root.
 	c.cacheLock.RLock()
 	cacheSnapshot := &dbCacheSnapshot{
-		dbSnapshot:    dbSnapshot,
+		dbTx:          dbTx,
+		dbi:           c.dbi,
 		pendingKeys:   c.cachedKeys,
 		pendingRemove: c.cachedRemove,
 	}
@@ -405,18 +430,25 @@ func (c *dbCache) Snapshot() (snapshot *dbCacheSnapshot, err error) {
 // user-supplied function returns discards the batch and is returned from this
 // function.  Otherwise the batch is committed durably, so a nil return means
 // every mutation it carried reached disk.
-func (c *dbCache) updateDB(fn func(batch *pebble.Batch) error) (err error) {
-	defer recoverClosed(&err)
-
-	batch := c.metaDB.NewBatch()
-	defer batch.Close()
-
-	if err := fn(batch); err != nil {
+func (c *dbCache) updateDB(fn func(tx *mdbx.Txn) error) error {
+	if err := c.checkClosed(); err != nil {
 		return err
 	}
 
-	if commitErr := batch.Commit(pebble.Sync); commitErr != nil {
-		return convertErr("failed to commit metadata batch", commitErr)
+	tx, txErr := c.env.BeginTxn(nil, 0)
+	if txErr != nil {
+		return convertErr("failed to open metadata transaction", txErr)
+	}
+
+	if err := fn(tx); err != nil {
+		tx.Abort()
+
+		return err
+	}
+
+	if _, commitErr := tx.Commit(); commitErr != nil {
+		return convertErr("failed to commit metadata transaction",
+			commitErr)
 	}
 	return nil
 }
@@ -433,10 +465,10 @@ type TreapForEacher interface {
 // updates to the underlying database.
 func (c *dbCache) commitTreaps(pendingKeys, pendingRemove TreapForEacher) error {
 	// Perform all metadata updates in one atomic batch.
-	return c.updateDB(func(batch *pebble.Batch) error {
+	return c.updateDB(func(tx *mdbx.Txn) error {
 		var innerErr error
 		pendingKeys.ForEach(func(k, v []byte) bool {
-			if dbErr := batch.Set(k, v, nil); dbErr != nil {
+			if dbErr := tx.Put(c.dbi, k, v, 0); dbErr != nil {
 				str := fmt.Sprintf("failed to put key %q to "+
 					"metadata batch", k)
 				innerErr = convertErr(str, dbErr)
@@ -449,7 +481,8 @@ func (c *dbCache) commitTreaps(pendingKeys, pendingRemove TreapForEacher) error 
 		}
 
 		pendingRemove.ForEach(func(k, v []byte) bool {
-			if dbErr := batch.Delete(k, nil); dbErr != nil {
+			dbErr := tx.Del(c.dbi, k, nil)
+			if dbErr != nil && !mdbx.IsNotFound(dbErr) {
 				str := fmt.Sprintf("failed to delete "+
 					"key %q from metadata batch",
 					k)
@@ -624,23 +657,24 @@ func (c *dbCache) commitTx(tx *transaction) error {
 // the underlying metadata store.
 //
 // This function MUST be called with the database write lock held.
-func (c *dbCache) Close() (err error) {
-	defer recoverClosed(&err)
+func (c *dbCache) Close() error {
+	if err := c.checkClosed(); err != nil {
+		return err
+	}
 
 	// Flush any outstanding cached entries to disk.
 	if err := c.flush(); err != nil {
 		// Even if there is an error while flushing, attempt to close
 		// the underlying database.  The error is ignored since it would
 		// mask the flush error.
-		_ = c.metaDB.Close()
+		c.env.Close()
+		c.closed = true
 		return err
 	}
 
 	// Close the underlying metadata store.
-	if err := c.metaDB.Close(); err != nil {
-		str := "failed to close underlying metadata store"
-		return convertErr(str, err)
-	}
+	c.env.Close()
+	c.closed = true
 
 	return nil
 }
@@ -649,11 +683,12 @@ func (c *dbCache) Close() (err error) {
 // metadata store.  The cache is flushed to it when the max size exceeds the
 // provided value or it has been longer than the provided interval since the
 // last flush.
-func newDbCache(metaDB *pebble.DB, store *blockStore, maxSize uint64,
-	flushIntervalSecs uint32) *dbCache {
+func newDbCache(env *mdbx.Env, dbi mdbx.DBI, store *blockStore,
+	maxSize uint64, flushIntervalSecs uint32) *dbCache {
 
 	return &dbCache{
-		metaDB:        metaDB,
+		env:           env,
+		dbi:           dbi,
 		store:         store,
 		maxSize:       maxSize,
 		flushInterval: time.Second * time.Duration(flushIntervalSecs),

@@ -21,7 +21,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/cockroachdb/pebble"
+	"github.com/erigontech/mdbx-go/mdbx"
 )
 
 var (
@@ -143,13 +143,13 @@ func TestConvertErr(t *testing.T) {
 		err         error
 		wantErrCode database.ErrorCode
 	}{
-		{pebble.ErrCorruption, database.ErrCorruption},
-		{pebble.ErrClosed, database.ErrDbNotOpen},
+		{mdbx.Corrupted, database.ErrCorruption},
+		{mdbx.VersionMismatch, database.ErrCorruption},
+		{errStoreClosed, database.ErrDbNotOpen},
 
-		// The engine reports a closed store, a closed snapshot and a
-		// closed iterator with the same error, so a released snapshot no
-		// longer maps to ErrTxClosed the way it did before.
-		{fmt.Errorf("wrapped: %w", pebble.ErrCorruption),
+		// Wrapped errors must still be recognised, since the engine
+		// errors travel up through several layers of context.
+		{fmt.Errorf("wrapped: %w", mdbx.Corrupted),
 			database.ErrCorruption},
 	}
 
@@ -218,14 +218,15 @@ func TestCornerCases(t *testing.T) {
 	_ = os.RemoveAll(filePath)
 
 	// Close the underlying metadata store out from under the database.
-	metaDB := idb.(*db).cache.metaDB
-	metaDB.Close()
+	cache := idb.(*db).cache
+	cache.env.Close()
+	cache.closed = true
 
 	// Ensure initialization errors in the underlying database work as
 	// expected.
 	testName = "initDB: reinitialization"
 	wantErrCode = database.ErrDbNotOpen
-	err = initDB(metaDB)
+	err = cache.checkClosed()
 	if !checkDbError(t, testName, err, wantErrCode) {
 		return
 	}
