@@ -434,6 +434,15 @@ func serializeSpendJournalEntry(stxos []SpentTxOut) []byte {
 		return nil
 	}
 
+	// Every stxo encodes independently and the layout is deterministic, so
+	// a large journal is encoded in parallel: size each entry, lay the
+	// regions out with a prefix sum, and fill the regions concurrently.
+	// The output is byte-identical to the serial path, which small
+	// journals keep taking.
+	if len(stxos) >= 512 {
+		return serializeSpendJournalParallel(stxos)
+	}
+
 	// Calculate the size needed to serialize the entire journal entry.
 	var size int
 	for i := range stxos {
@@ -447,6 +456,51 @@ func serializeSpendJournalEntry(stxos []SpentTxOut) []byte {
 	for i := len(stxos) - 1; i > -1; i-- {
 		offset += putSpentTxOut(serialized[offset:], &stxos[i])
 	}
+
+	return serialized
+}
+
+// serializeSpendJournalParallel is the concurrent equivalent of the serial
+// loop in serializeSpendJournalEntry.  The journal stores stxos in reverse
+// order: stxo len-1 first and stxo 0 last.
+func serializeSpendJournalParallel(stxos []SpentTxOut) []byte {
+	const workers = 8
+
+	// Size every entry concurrently.
+	sizes := make([]int, len(stxos))
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := w; i < len(stxos); i += workers {
+				sizes[i] = spentTxOutSerializeSize(&stxos[i])
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// Lay out the regions: walking the array backwards mirrors the
+	// reverse-order serial loop, so offsets[i] is where stxo i lands.
+	offsets := make([]int, len(stxos))
+	var total int
+	for i := len(stxos) - 1; i > -1; i-- {
+		offsets[i] = total
+		total += sizes[i]
+	}
+	serialized := make([]byte, total)
+
+	// Fill every region concurrently.
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := w; i < len(stxos); i += workers {
+				putSpentTxOut(serialized[offsets[i]:], &stxos[i])
+			}
+		}(w)
+	}
+	wg.Wait()
 
 	return serialized
 }

@@ -141,16 +141,26 @@ func (s *utxoCache) connectTransactionsParallel(block *btcutil.Block,
 func (s *utxoCache) spendTxInAt(txIn *wire.TxIn, journal []SpentTxOut,
 	idx int) error {
 
-	entries, err := s.fetchEntries([]wire.OutPoint{txIn.PreviousOutPoint})
-	if err != nil {
-		return err
+	// Nearly every input hits the cache, so probe it directly before
+	// falling back to the general fetch path with its allocations.  A
+	// cached nil is a negative entry: the database was consulted before
+	// and holds nothing.
+	entry, found := s.cachedEntries.get(txIn.PreviousOutPoint)
+	if !found {
+		entries, err := s.fetchEntries(
+			[]wire.OutPoint{txIn.PreviousOutPoint},
+		)
+		if err != nil {
+			return err
+		}
+		if len(entries) == 1 {
+			entry = entries[0]
+		}
 	}
-	if len(entries) != 1 || entries[0] == nil {
+	if entry == nil {
 		return AssertError(fmt.Sprintf("missing input %v",
 			txIn.PreviousOutPoint))
 	}
-
-	entry := entries[0]
 	if journal != nil {
 		journal[idx] = SpentTxOut{
 			Amount:     entry.Amount(),
