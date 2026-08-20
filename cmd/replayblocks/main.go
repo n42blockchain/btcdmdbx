@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"sort"
 	"sync"
@@ -39,6 +40,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/database"
 	_ "github.com/btcsuite/btcd/database/ffldb"
+	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
@@ -57,6 +59,9 @@ type config struct {
 	fastAdd    bool
 	cpuProfile string
 	utxoCache  int
+	gogc       int
+	memLimitGB int
+	sigCache   int
 	workers    int
 	depth      int
 	logPath    string
@@ -99,10 +104,20 @@ func parseFlags() *config {
 	flag.IntVar(&cfg.reportSecs, "report", 30,
 		"seconds between progress reports")
 	flag.BoolVar(&cfg.fastAdd, "fastadd", true,
-		"skip the checks a checkpointed block does not need, which is "+
-			"what a syncing node does below its last checkpoint. Pass "+
-			"--fastadd=false to validate every block in full, which "+
-			"measures signature verification rather than storage")
+		"use fast-add below the last checkpoint.  Blocks above it are "+
+			"always validated in full regardless of this flag; "+
+			"--fastadd=false extends full validation to every "+
+			"height")
+	flag.IntVar(&cfg.gogc, "gogc", 400,
+		"GC percent.  The replay holds a very large, mostly static "+
+			"heap, where the default of 100 spends a significant "+
+			"share of CPU re-marking objects that never die")
+	flag.IntVar(&cfg.memLimitGB, "memlimit", 112,
+		"soft memory limit in GiB handed to the runtime so a high "+
+			"gogc cannot run the process into the ground")
+	flag.IntVar(&cfg.sigCache, "sigcache", 1000000,
+		"signature cache entries for full validation above the "+
+			"checkpoint")
 	flag.StringVar(&cfg.cpuProfile, "cpuprofile", "",
 		"write a CPU profile to this path")
 	flag.BoolVar(&cfg.loadOnly, "loadonly", false,
@@ -404,6 +419,24 @@ func startPipeline(reader *blockFileReader, workers,
 					)
 					result.block = block
 					result.err = err
+
+					// Precompute every hash validation will
+					// ask for.  Sanity checking recomputes
+					// the merkle root, which hashes every
+					// transaction; btcutil caches those
+					// hashes on first use, so computing
+					// them here moves that work off the
+					// serial connect loop and onto the
+					// workers.  The channel handoff is the
+					// memory barrier that publishes the
+					// cached values.
+					if err == nil {
+						block.Hash()
+						for _, tx := range block.Transactions() {
+							tx.Hash()
+							tx.WitnessHash()
+						}
+					}
 				}
 
 				select {
@@ -474,6 +507,11 @@ func run(cfg *config) error {
 		return fmt.Errorf("both --src and --dst are required")
 	}
 
+	debug.SetGCPercent(cfg.gogc)
+	if cfg.memLimitGB > 0 {
+		debug.SetMemoryLimit(int64(cfg.memLimitGB) << 30)
+	}
+
 	if cfg.cpuProfile != "" {
 		f, err := os.Create(cfg.cpuProfile)
 		if err != nil {
@@ -521,9 +559,23 @@ func run(cfg *config) error {
 
 	openStart := time.Now()
 	chain, err := blockchain.New(&blockchain.Config{
-		DB:               db,
-		ChainParams:      params,
-		TimeSource:       blockchain.NewMedianTime(),
+		DB:          db,
+		ChainParams: params,
+		TimeSource:  blockchain.NewMedianTime(),
+
+		// Without this the chain has no checkpoints at all:
+		// findPreviousCheckpoint returns nil and the per-checkpoint
+		// hash pinning silently never runs.  It is the anchor that
+		// makes fast-add below the checkpoint safe, so it is not
+		// optional.
+		Checkpoints: params.Checkpoints,
+
+		// Full validation above the checkpoint fans signature checks
+		// out across NumCPU*3 goroutines; these caches are what make
+		// repeated signatures and sighash midstates cheap there.
+		SigCache:  txscript.NewSigCache(uint(cfg.sigCache)),
+		HashCache: txscript.NewHashCache(uint(cfg.sigCache / 5)),
+
 		UtxoCacheMaxSize: uint64(cfg.utxoCache) * 1024 * 1024,
 	})
 	if err != nil {
@@ -538,14 +590,23 @@ func run(cfg *config) error {
 		return nil
 	}
 
-	flags := blockchain.BFNone
-	if cfg.fastAdd {
-		flags = blockchain.BFFastAdd
+	// Fast-add applies only below the last checkpoint, which is the same
+	// boundary a syncing node uses: below it the checkpoint hash pinning
+	// anchors the chain, above it every rule runs.
+	lastCheckpoint := int32(0)
+	if checkpoint := chain.LatestCheckpoint(); checkpoint != nil {
+		lastCheckpoint = checkpoint.Height
 	}
+	fastBelow := int32(0)
+	if cfg.fastAdd {
+		fastBelow = lastCheckpoint
+	}
+	logf("fast-add below height %d, full validation above\n",
+		fastBelow)
 
-	mode := "fast-add (checkpoint behaviour, storage-bound)"
+	mode := "fast-add below checkpoint, full validation above"
 	if !cfg.fastAdd {
-		mode = "full validation (signature-bound)"
+		mode = "full validation at every height"
 	}
 	fmt.Printf("replaying from %s\n", cfg.src)
 	fmt.Printf("building     %s\n", cfg.dst)
@@ -604,6 +665,12 @@ func run(cfg *config) error {
 			skipped++
 
 			continue
+		}
+
+		flags := blockchain.BFNone
+		nextHeight := chain.BestSnapshot().Height + 1
+		if nextHeight <= fastBelow {
+			flags = blockchain.BFFastAdd
 		}
 
 		stageStart = time.Now()
@@ -684,28 +751,28 @@ func run(cfg *config) error {
 	total := dirSize(cfg.dst)
 
 	fmt.Printf("\n=== done ===\n")
-	fmt.Printf("  height           %d\n", best.Height)
-	fmt.Printf("  blocks replayed  %d (%d skipped)\n", processed, skipped)
-	fmt.Printf("  elapsed          %s\n", elapsed.Truncate(time.Second))
-	fmt.Printf("  utxo flush       %s\n", flushTime.Truncate(time.Second))
-	fmt.Printf("  average rate     %.1f blocks/s\n",
+	logf("  height           %d\n", best.Height)
+	logf("  blocks replayed  %d (%d skipped)\n", processed, skipped)
+	logf("  elapsed          %s\n", elapsed.Truncate(time.Second))
+	logf("  utxo flush       %s\n", flushTime.Truncate(time.Second))
+	logf("  average rate     %.1f blocks/s\n",
 		float64(processed)/elapsed.Seconds())
-	fmt.Printf("  metadata size    %.3f GB\n", float64(meta)/(1<<30))
+	logf("  metadata size    %.3f GB\n", float64(meta)/(1<<30))
 	totalStage := waitTime + processTime
 	if totalStage > 0 {
 		// Waiting on the pipeline is the read, checksum and parse cost
 		// that could not be hidden behind the connect loop.  Near zero
 		// means the pipeline is keeping the loop fed.
-		fmt.Printf("  pipeline wait    %8s  %5.1f%%\n",
+		logf("  pipeline wait    %8s  %5.1f%%\n",
 			waitTime.Truncate(time.Second),
 			float64(waitTime)/float64(totalStage)*100)
-		fmt.Printf("  process          %8s  %5.1f%%\n",
+		logf("  process          %8s  %5.1f%%\n",
 			processTime.Truncate(time.Second),
 			float64(processTime)/float64(totalStage)*100)
 	}
-	fmt.Printf("  total size       %.3f GB\n", float64(total)/(1<<30))
+	logf("  total size       %.3f GB\n", float64(total)/(1<<30))
 	if best.Height > 0 {
-		fmt.Printf("  metadata/block   %.1f bytes\n",
+		logf("  metadata/block   %.1f bytes\n",
 			float64(meta)/float64(best.Height))
 	}
 

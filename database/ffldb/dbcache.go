@@ -19,7 +19,14 @@ import (
 
 const (
 	// defaultCacheSize is the default size for the database cache.
-	defaultCacheSize = 100 * 1024 * 1024 // 100 MB
+	//
+	// Half a gigabyte rather than the historical 100 MB: the dominant
+	// write during sync is the spend journal, whose entries are keyed
+	// by block hash and therefore land at random positions in the
+	// B-tree.  Fewer, larger commits dirty fewer pages per byte.  The
+	// five-minute flush interval below still bounds how much a crash
+	// can lose.
+	defaultCacheSize = 512 * 1024 * 1024 // 512 MB
 
 	// defaultFlushSecs is the default number of seconds to use as a
 	// threshold in between database cache flushes when the cache size has
