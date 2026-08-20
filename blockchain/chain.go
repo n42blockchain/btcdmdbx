@@ -100,6 +100,7 @@ type BlockChain struct {
 	chainParams         *chaincfg.Params
 	timeSource          MedianTimeSource
 	sigCache            *txscript.SigCache
+	utxoApplyWorkers    int
 	indexManager        IndexManager
 	hashCache           *txscript.HashCache
 
@@ -1215,7 +1216,14 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 		// Connect the transactions to the cache.  All the txs are considered valid
 		// at this point as they have passed validation or was considered valid already.
 		stxos := make([]SpentTxOut, 0, countSpentOutputs(block))
-		err := b.utxoCache.connectTransactions(block, &stxos)
+		var err error
+		if b.utxoApplyWorkers > 1 {
+			err = b.utxoCache.connectTransactionsParallel(
+				block, &stxos, b.utxoApplyWorkers,
+			)
+		} else {
+			err = b.utxoCache.connectTransactions(block, &stxos)
+		}
 		if err != nil {
 			return false, err
 		}
@@ -2183,6 +2191,12 @@ type Config struct {
 	// time is adjusted to be in agreement with other peers.
 	TimeSource MedianTimeSource
 
+	// UtxoApplyWorkers is the number of goroutines used to apply a
+	// block's utxo changes to the cache.  Zero or one keeps the historical
+	// serial behaviour.  The parallel path preserves consensus ordering by
+	// sharding on outpoint; see connectTransactionsParallel.
+	UtxoApplyWorkers int
+
 	// SigCache defines a signature cache to use when when validating
 	// signatures.  This is typically most useful when individual
 	// transactions are already being validated prior to their inclusion in
@@ -2257,6 +2271,7 @@ func New(config *Config) (*BlockChain, error) {
 		chainParams:         params,
 		timeSource:          config.TimeSource,
 		sigCache:            config.SigCache,
+		utxoApplyWorkers:    config.UtxoApplyWorkers,
 		indexManager:        config.IndexManager,
 		minRetargetTimespan: targetTimespan / adjustmentFactor,
 		maxRetargetTimespan: targetTimespan * adjustmentFactor,

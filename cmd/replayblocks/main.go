@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -52,20 +54,22 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 const blockFileExtension = ".fdb"
 
 type config struct {
-	src        string
-	dst        string
-	maxHeight  int
-	reportSecs int
-	fastAdd    bool
-	cpuProfile string
-	utxoCache  int
-	gogc       int
-	memLimitGB int
-	sigCache   int
-	workers    int
-	depth      int
-	logPath    string
-	loadOnly   bool
+	src         string
+	dst         string
+	maxHeight   int
+	reportSecs  int
+	fastAdd     bool
+	cpuProfile  string
+	utxoCache   int
+	gogc        int
+	memLimitGB  int
+	sigCache    int
+	pprofAddr   string
+	utxoWorkers int
+	workers     int
+	depth       int
+	logPath     string
+	loadOnly    bool
 }
 
 // logOut is where progress is written, in addition to standard output.
@@ -115,6 +119,13 @@ func parseFlags() *config {
 	flag.IntVar(&cfg.memLimitGB, "memlimit", 112,
 		"soft memory limit in GiB handed to the runtime so a high "+
 			"gogc cannot run the process into the ground")
+	flag.IntVar(&cfg.utxoWorkers, "utxoworkers", 12,
+		"goroutines applying a block's utxo changes to the cache; the "+
+			"work is DRAM-latency bound, so this scales with memory "+
+			"parallelism rather than core count")
+	flag.StringVar(&cfg.pprofAddr, "pprofaddr", "127.0.0.1:6161",
+		"serve net/http/pprof here so a long run can be profiled "+
+			"live at any phase; empty disables it")
 	flag.IntVar(&cfg.sigCache, "sigcache", 1000000,
 		"signature cache entries for full validation above the "+
 			"checkpoint")
@@ -358,8 +369,8 @@ type parsedBlock struct {
 // record is tagged with its position and the results are reordered before
 // being handed to the caller, so the connect loop still sees strict chain
 // order.
-func startPipeline(reader *blockFileReader, workers,
-	depth int) (<-chan parsedBlock, func()) {
+func startPipeline(reader *blockFileReader, workers, depth int,
+	sanity func(*btcutil.Block) error) (<-chan parsedBlock, func()) {
 
 	type rawBlock struct {
 		seq  uint64
@@ -436,6 +447,11 @@ func startPipeline(reader *blockFileReader, workers,
 							tx.Hash()
 							tx.WitnessHash()
 						}
+
+						// Run the context-free sanity checks
+						// here too, so the serial loop can
+						// skip them via BFSanityDone.
+						result.err = sanity(result.block)
 					}
 				}
 
@@ -507,6 +523,14 @@ func run(cfg *config) error {
 		return fmt.Errorf("both --src and --dst are required")
 	}
 
+	if cfg.pprofAddr != "" {
+		go func() {
+			// Profiling endpoint only; failure to bind is not worth
+			// stopping a replay over.
+			_ = http.ListenAndServe(cfg.pprofAddr, nil)
+		}()
+	}
+
 	debug.SetGCPercent(cfg.gogc)
 	if cfg.memLimitGB > 0 {
 		debug.SetMemoryLimit(int64(cfg.memLimitGB) << 30)
@@ -557,11 +581,13 @@ func run(cfg *config) error {
 		}
 	}()
 
+	timeSource := blockchain.NewMedianTime()
+
 	openStart := time.Now()
 	chain, err := blockchain.New(&blockchain.Config{
 		DB:          db,
 		ChainParams: params,
-		TimeSource:  blockchain.NewMedianTime(),
+		TimeSource:  timeSource,
 
 		// Without this the chain has no checkpoints at all:
 		// findPreviousCheckpoint returns nil and the per-checkpoint
@@ -577,6 +603,7 @@ func run(cfg *config) error {
 		HashCache: txscript.NewHashCache(uint(cfg.sigCache / 5)),
 
 		UtxoCacheMaxSize: uint64(cfg.utxoCache) * 1024 * 1024,
+		UtxoApplyWorkers: cfg.utxoWorkers,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create chain: %w", err)
@@ -640,7 +667,12 @@ func run(cfg *config) error {
 	// parallelising, so it is measured rather than assumed.
 	var waitTime, processTime time.Duration
 
-	blocks, stopPipeline := startPipeline(reader, cfg.workers, cfg.depth)
+	sanity := func(b *btcutil.Block) error {
+		return blockchain.CheckBlockSanity(b, params.PowLimit, timeSource)
+	}
+	blocks, stopPipeline := startPipeline(
+		reader, cfg.workers, cfg.depth, sanity,
+	)
 	defer stopPipeline()
 
 	for {
@@ -667,10 +699,11 @@ func run(cfg *config) error {
 			continue
 		}
 
-		flags := blockchain.BFNone
+		// Sanity ran in the pipeline workers already.
+		flags := blockchain.BFSanityDone
 		nextHeight := chain.BestSnapshot().Height + 1
 		if nextHeight <= fastBelow {
-			flags = blockchain.BFFastAdd
+			flags |= blockchain.BFFastAdd
 		}
 
 		stageStart = time.Now()

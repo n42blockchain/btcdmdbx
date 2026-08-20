@@ -30,6 +30,12 @@ const (
 	// not be performed.
 	BFNoPoWCheck
 
+	// BFSanityDone may be set to indicate CheckBlockSanity has already
+	// been run for this block, so running it again would only repeat
+	// work.  Callers use this to perform the context-free sanity checks
+	// concurrently ahead of the serial processing path.
+	BFSanityDone
+
 	// BFNone is a convenience value to specifically indicate no flags.
 	BFNone BehaviorFlags = 0
 )
@@ -165,10 +171,14 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 		return false, false, ruleError(ErrDuplicateBlock, str)
 	}
 
-	// Perform preliminary sanity checks on the block and its transactions.
-	err = checkBlockSanity(block, b.chainParams.PowLimit, b.timeSource, flags)
-	if err != nil {
-		return false, false, err
+	// Perform preliminary sanity checks on the block and its transactions,
+	// unless the caller already ran them ahead of time.
+	if flags&BFSanityDone != BFSanityDone {
+		err = checkBlockSanity(block, b.chainParams.PowLimit,
+			b.timeSource, flags)
+		if err != nil {
+			return false, false, err
+		}
 	}
 
 	// Find the previous checkpoint and perform some additional checks based

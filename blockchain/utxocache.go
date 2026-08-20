@@ -6,8 +6,10 @@ package blockchain
 
 import (
 	"container/list"
+	"encoding/binary"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -17,165 +19,138 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
-// mapSlice is a slice of maps for utxo entries.  The slice of maps are needed to
-// guarantee that the map will only take up N amount of bytes.  As of v1.20, the
-// go runtime will allocate 2^N + few extra buckets, meaning that for large N, we'll
-// allocate a lot of extra memory if the amount of entries goes over the previously
-// allocated buckets.  A slice of maps allows us to have a better control of how much
-// total memory gets allocated by all the maps.
-type mapSlice struct {
-	// mtx protects against concurrent access for the map slice.
+// utxoShardCount is the number of independently locked shards the cached
+// utxo entries are split across.  Sharding by outpoint keeps operations from
+// different goroutines out of each other's way, which is what allows a
+// block's transactions to be connected in parallel: every operation on a
+// given outpoint routes to the same shard, so per-outpoint ordering is
+// preserved simply by handing each shard's operations to one goroutine in
+// block order.  Must be a power of two.
+const utxoShardCount = 64
+
+// utxoShard is one independently locked partition of the cached entries.
+// The padding keeps neighbouring locks out of one cache line, since the
+// entire point of the split is that shards do not contend.
+type utxoShard struct {
 	mtx sync.Mutex
-
-	// maps are the underlying maps in the slice of maps.
-	maps []map[wire.OutPoint]*UtxoEntry
-
-	// maxEntries is the maximum amount of elements that the map is allocated for.
-	maxEntries []int
-
-	// maxTotalMemoryUsage is the maximum memory usage in bytes that the state
-	// should contain in normal circumstances.
-	maxTotalMemoryUsage uint64
+	m   map[wire.OutPoint]*UtxoEntry
+	_   [40]byte
 }
 
-// length returns the length of all the maps in the map slice added together.
+// mapSlice splits the cached utxo entries across independently locked
+// shards keyed by outpoint hash.  The historical design was a growable
+// slice of maps guarded by one mutex, which both serialized concurrent
+// access and probed every map on each lookup; fixed hash routing removes
+// both costs.
+type mapSlice struct {
+	shards []utxoShard
+
+	// prealloc is the per-shard map pre-allocation, kept so the rough
+	// size estimate stays stable as shards fill and empty.
+	prealloc int
+}
+
+// newMapSlice returns a mapSlice whose shards together pre-allocate room
+// for the given number of entries.
+func newMapSlice(totalEntries int) mapSlice {
+	perShard := totalEntries / utxoShardCount
+	if perShard < 1 {
+		perShard = 1
+	}
+
+	ms := mapSlice{
+		shards:   make([]utxoShard, utxoShardCount),
+		prealloc: perShard,
+	}
+	for i := range ms.shards {
+		ms.shards[i].m = make(map[wire.OutPoint]*UtxoEntry, perShard)
+	}
+
+	return ms
+}
+
+// shardIndexFor routes an outpoint to a shard.  The leading bytes of a txid
+// are uniformly distributed, so they make a fine shard key on their own.
+func shardIndexFor(op *wire.OutPoint) int {
+	return int(binary.LittleEndian.Uint32(op.Hash[:4])) &
+		(utxoShardCount - 1)
+}
+
+// length returns the number of cached entries across every shard.
 //
 // This function is safe for concurrent access.
 func (ms *mapSlice) length() int {
-	ms.mtx.Lock()
-	defer ms.mtx.Unlock()
-
 	var l int
-	for _, m := range ms.maps {
-		l += len(m)
+	for i := range ms.shards {
+		sh := &ms.shards[i]
+		sh.mtx.Lock()
+		l += len(sh.m)
+		sh.mtx.Unlock()
 	}
 
 	return l
 }
 
-// size returns the size of all the maps in the map slice added together.
+// size returns a rough estimate of the memory the shard maps occupy.
 //
 // This function is safe for concurrent access.
 func (ms *mapSlice) size() int {
-	ms.mtx.Lock()
-	defer ms.mtx.Unlock()
-
 	var size int
-	for _, num := range ms.maxEntries {
-		size += calculateRoughMapSize(num, bucketSize)
+	for i := range ms.shards {
+		sh := &ms.shards[i]
+		sh.mtx.Lock()
+		n := len(sh.m)
+		sh.mtx.Unlock()
+		if n < ms.prealloc {
+			n = ms.prealloc
+		}
+		size += calculateRoughMapSize(n, bucketSize)
 	}
 
 	return size
 }
 
-// get looks for the outpoint in all the maps in the map slice and returns
-// the entry.  nil and false is returned if the outpoint is not found.
+// get returns the entry for the outpoint if one is cached.
 //
 // This function is safe for concurrent access.
 func (ms *mapSlice) get(op wire.OutPoint) (*UtxoEntry, bool) {
-	ms.mtx.Lock()
-	defer ms.mtx.Unlock()
+	sh := &ms.shards[shardIndexFor(&op)]
+	sh.mtx.Lock()
+	entry, found := sh.m[op]
+	sh.mtx.Unlock()
 
-	var entry *UtxoEntry
-	var found bool
-
-	for _, m := range ms.maps {
-		entry, found = m[op]
-		if found {
-			return entry, found
-		}
-	}
-
-	return nil, false
+	return entry, found
 }
 
-// put puts the outpoint and the entry into one of the maps in the map slice.  If the
-// existing maps are all full, it will allocate a new map based on how much memory we
-// have left over.  Leftover memory is calculated as:
-// maxTotalMemoryUsage - (totalEntryMemory + mapSlice.size())
+// put stores the entry for the outpoint, replacing any existing one.
 //
 // This function is safe for concurrent access.
-func (ms *mapSlice) put(op wire.OutPoint, entry *UtxoEntry, totalEntryMemory uint64) {
-	ms.mtx.Lock()
-	defer ms.mtx.Unlock()
-
-	// Look for the key in the maps.
-	for i := range ms.maxEntries {
-		m := ms.maps[i]
-		_, found := m[op]
-		if found {
-			// If the key is found, overwrite it.
-			m[op] = entry
-			return // Return as we were successful in adding the entry.
-		}
-	}
-
-	for i, maxNum := range ms.maxEntries {
-		m := ms.maps[i]
-		if len(m) >= maxNum {
-			// Don't try to insert if the map already at max since
-			// that'll force the map to allocate double the memory it's
-			// currently taking up.
-			continue
-		}
-
-		m[op] = entry
-		return // Return as we were successful in adding the entry.
-	}
-
-	// We only reach this code if we've failed to insert into the map above as
-	// all the current maps were full.  We thus make a new map and insert into
-	// it.
-	m := ms.makeNewMap(totalEntryMemory)
-	m[op] = entry
+func (ms *mapSlice) put(op wire.OutPoint, entry *UtxoEntry) {
+	sh := &ms.shards[shardIndexFor(&op)]
+	sh.mtx.Lock()
+	sh.m[op] = entry
+	sh.mtx.Unlock()
 }
 
-// delete attempts to delete the given outpoint in all of the maps. No-op if the
-// outpoint doesn't exist.
+// delete removes the outpoint from its shard.  No-op if absent.
 //
 // This function is safe for concurrent access.
 func (ms *mapSlice) delete(op wire.OutPoint) {
-	ms.mtx.Lock()
-	defer ms.mtx.Unlock()
-
-	for i := 0; i < len(ms.maps); i++ {
-		delete(ms.maps[i], op)
-	}
+	sh := &ms.shards[shardIndexFor(&op)]
+	sh.mtx.Lock()
+	delete(sh.m, op)
+	sh.mtx.Unlock()
 }
 
-// makeNewMap makes and appends the new map into the map slice.
-//
-// This function is NOT safe for concurrent access and must be called with the
-// lock held.
-func (ms *mapSlice) makeNewMap(totalEntryMemory uint64) map[wire.OutPoint]*UtxoEntry {
-	// Get the size of the leftover memory.
-	memSize := ms.maxTotalMemoryUsage - totalEntryMemory
-	for _, maxNum := range ms.maxEntries {
-		memSize -= uint64(calculateRoughMapSize(maxNum, bucketSize))
-	}
-
-	// Get a new map that's sized to house inside the leftover memory.
-	// -1 on the returned value will make the map allocate half as much total
-	// bytes.  This is done to make sure there's still room left for utxo
-	// entries to take up.
-	numMaxElements := calculateMinEntries(int(memSize), bucketSize+avgEntrySize)
-	numMaxElements -= 1
-	ms.maxEntries = append(ms.maxEntries, numMaxElements)
-	ms.maps = append(ms.maps, make(map[wire.OutPoint]*UtxoEntry, numMaxElements))
-
-	return ms.maps[len(ms.maps)-1]
-}
-
-// deleteMaps deletes all maps except for the first one which should be the biggest.
-//
-// This function is safe for concurrent access.
+// deleteMaps releases every shard map and allocates fresh pre-sized ones,
+// which is how the cache empties itself after a flush.
 func (ms *mapSlice) deleteMaps() {
-	ms.mtx.Lock()
-	defer ms.mtx.Unlock()
-
-	size := ms.maxEntries[0]
-	ms.maxEntries = []int{size}
-	ms.maps = ms.maps[:1]
+	for i := range ms.shards {
+		sh := &ms.shards[i]
+		sh.mtx.Lock()
+		sh.m = make(map[wire.OutPoint]*UtxoEntry, ms.prealloc)
+		sh.mtx.Unlock()
+	}
 }
 
 const (
@@ -236,16 +211,10 @@ func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
 
 	log.Infof("Pre-allocating for %d MiB", maxTotalMemoryUsage/(1024*1024)+1)
 
-	m := make(map[wire.OutPoint]*UtxoEntry, numMaxElements)
-
 	return &utxoCache{
 		db:                  db,
 		maxTotalMemoryUsage: maxTotalMemoryUsage,
-		cachedEntries: mapSlice{
-			maps:                []map[wire.OutPoint]*UtxoEntry{m},
-			maxEntries:          []int{numMaxElements},
-			maxTotalMemoryUsage: maxTotalMemoryUsage,
-		},
+		cachedEntries:       newMapSlice(numMaxElements),
 	}
 }
 
@@ -254,7 +223,7 @@ func (s *utxoCache) totalMemoryUsage() uint64 {
 	// Total memory is the map size + the size that the utxo entries are
 	// taking up.
 	size := uint64(s.cachedEntries.size())
-	size += s.totalEntryMemory
+	size += atomic.LoadUint64(&s.totalEntryMemory)
 
 	return size
 }
@@ -321,8 +290,8 @@ func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error
 	// as a miss; this prevents future lookups to perform the same database
 	// fetch.
 	for i := range dbEntries {
-		s.cachedEntries.put(missingOps[i], dbEntries[i], s.totalEntryMemory)
-		s.totalEntryMemory += dbEntries[i].memoryUsage()
+		s.cachedEntries.put(missingOps[i], dbEntries[i])
+		atomic.AddUint64(&s.totalEntryMemory, dbEntries[i].memoryUsage())
 	}
 
 	// Fill in the entries with the ones fetched from the database.
@@ -363,8 +332,8 @@ func (s *utxoCache) addTxOut(outpoint wire.OutPoint, txOut *wire.TxOut, isCoinBa
 		entry.packedFlags |= tfCoinBase
 	}
 
-	s.cachedEntries.put(outpoint, entry, s.totalEntryMemory)
-	s.totalEntryMemory += entry.memoryUsage()
+	s.cachedEntries.put(outpoint, entry)
+	atomic.AddUint64(&s.totalEntryMemory, entry.memoryUsage())
 
 	return nil
 }
@@ -433,12 +402,12 @@ func (s *utxoCache) addTxIn(txIn *wire.TxIn, stxos *[]SpentTxOut) error {
 	if entry.isFresh() {
 		// If the entry is fresh, we will always have it in the cache.
 		s.cachedEntries.delete(txIn.PreviousOutPoint)
-		s.totalEntryMemory -= entry.memoryUsage()
+		atomic.AddUint64(&s.totalEntryMemory, ^(entry.memoryUsage() - 1))
 	} else {
 		// Can leave the entry to be garbage collected as the only purpose
 		// of this entry now is so that the entry on disk can be deleted.
 		entry = nil
-		s.totalEntryMemory -= entry.memoryUsage()
+		atomic.AddUint64(&s.totalEntryMemory, ^(entry.memoryUsage() - 1))
 	}
 
 	return nil
@@ -504,8 +473,9 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 	// NOTE: The database has its own cache which gets atomically written
 	// to leveldb.
 	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
-	for i := range s.cachedEntries.maps {
-		for outpoint, entry := range s.cachedEntries.maps[i] {
+	for i := range s.cachedEntries.shards {
+		shard := &s.cachedEntries.shards[i]
+		for outpoint, entry := range shard.m {
 			switch {
 			// If the entry is nil or spent, remove the entry from the database
 			// and the cache.
@@ -525,11 +495,11 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 				}
 			}
 
-			delete(s.cachedEntries.maps[i], outpoint)
+			delete(shard.m, outpoint)
 		}
 	}
 	s.cachedEntries.deleteMaps()
-	s.totalEntryMemory = 0
+	atomic.StoreUint64(&s.totalEntryMemory, 0)
 
 	// When done, store the best state hash in the database to indicate the state
 	// is consistent until that hash.

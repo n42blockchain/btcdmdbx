@@ -44,25 +44,17 @@ func TestMapSlice(t *testing.T) {
 	for _, test := range tests {
 		m := make(map[wire.OutPoint]*UtxoEntry)
 
-		maxSize := calculateRoughMapSize(1000, bucketSize)
-
-		maxEntriesFirstMap := 500
-		ms1 := make(map[wire.OutPoint]*UtxoEntry, maxEntriesFirstMap)
-		ms := mapSlice{
-			maps:                []map[wire.OutPoint]*UtxoEntry{ms1},
-			maxEntries:          []int{maxEntriesFirstMap},
-			maxTotalMemoryUsage: uint64(maxSize),
-		}
+		ms := newMapSlice(1000)
 
 		for _, key := range test.keys {
 			m[key] = nil
-			ms.put(key, nil, 0)
+			ms.put(key, nil)
 		}
 
 		// Put in the same elements twice to test that the map slice won't hold duplicates.
 		for _, key := range test.keys {
 			m[key] = nil
-			ms.put(key, nil, 0)
+			ms.put(key, nil)
 		}
 
 		if len(m) != ms.length() {
@@ -74,7 +66,7 @@ func TestMapSlice(t *testing.T) {
 		delete(m, test.keys[0])
 
 		// Try to insert the last element in the mapslice again.
-		ms.put(test.keys[len(test.keys)-1], &UtxoEntry{}, 0)
+		ms.put(test.keys[len(test.keys)-1], &UtxoEntry{})
 		m[test.keys[len(test.keys)-1]] = &UtxoEntry{}
 
 		// Check that the duplicate didn't make it in.
@@ -82,7 +74,7 @@ func TestMapSlice(t *testing.T) {
 			t.Fatalf("expected len of %d, got %d", len(m), ms.length())
 		}
 
-		ms.put(test.keys[0], &UtxoEntry{}, 0)
+		ms.put(test.keys[0], &UtxoEntry{})
 		m[test.keys[0]] = &UtxoEntry{}
 
 		if len(m) != ms.length() {
@@ -130,15 +122,7 @@ func TestMapsliceConcurrency(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		maxSize := calculateRoughMapSize(1000, bucketSize)
-
-		maxEntriesFirstMap := 500
-		ms1 := make(map[wire.OutPoint]*UtxoEntry, maxEntriesFirstMap)
-		ms := mapSlice{
-			maps:                []map[wire.OutPoint]*UtxoEntry{ms1},
-			maxEntries:          []int{maxEntriesFirstMap},
-			maxTotalMemoryUsage: uint64(maxSize),
-		}
+		ms := newMapSlice(1000)
 
 		var wg sync.WaitGroup
 
@@ -146,7 +130,7 @@ func TestMapsliceConcurrency(t *testing.T) {
 		go func(m *mapSlice, keys []wire.OutPoint) {
 			defer wg.Done()
 			for i := 0; i < 5000; i++ {
-				m.put(keys[i], nil, 0)
+				m.put(keys[i], nil)
 			}
 		}(&ms, test.keys)
 
@@ -154,7 +138,7 @@ func TestMapsliceConcurrency(t *testing.T) {
 		go func(m *mapSlice, keys []wire.OutPoint) {
 			defer wg.Done()
 			for i := 5000; i < 10000; i++ {
-				m.put(keys[i], nil, 0)
+				m.put(keys[i], nil)
 			}
 		}(&ms, test.keys)
 
@@ -395,7 +379,6 @@ func utxoCacheTestChain(testName string) (*BlockChain, *chaincfg.Params, func())
 
 	chain.TstSetCoinbaseMaturity(1)
 	chain.utxoCache.maxTotalMemoryUsage = 10 * 1024 * 1024
-	chain.utxoCache.cachedEntries.maxTotalMemoryUsage = chain.utxoCache.maxTotalMemoryUsage
 
 	return chain, &params, tearDown
 }
@@ -440,7 +423,8 @@ func TestUtxoCacheFlush(t *testing.T) {
 	}
 
 	// All entries should be fresh and modified.
-	for _, m := range cache.cachedEntries.maps {
+	for i := range cache.cachedEntries.shards {
+		m := cache.cachedEntries.shards[i].m
 		for outpoint, entry := range m {
 			if entry == nil {
 				t.Fatalf("Unexpected nil entry found for %v", outpoint)
@@ -512,7 +496,8 @@ func TestUtxoCacheFlush(t *testing.T) {
 	}
 
 	// Check that the fetched entries in the cache are not marked fresh and modified.
-	for _, m := range cache.cachedEntries.maps {
+	for i := range cache.cachedEntries.shards {
+		m := cache.cachedEntries.shards[i].m
 		for outpoint, elem := range m {
 			if elem == nil {
 				t.Fatalf("Unexpected nil entry found for %v", outpoint)
@@ -736,7 +721,6 @@ func TestFlushOnPrune(t *testing.T) {
 	defer tearDown()
 
 	chain.utxoCache.maxTotalMemoryUsage = 10 * 1024 * 1024
-	chain.utxoCache.cachedEntries.maxTotalMemoryUsage = chain.utxoCache.maxTotalMemoryUsage
 
 	// Set the maxBlockFileSize and the prune target small so that we can trigger a
 	// prune to happen.
@@ -857,7 +841,6 @@ func TestInitConsistentState(t *testing.T) {
 	}
 	defer tearDown()
 	chain.utxoCache.maxTotalMemoryUsage = 10 * 1024 * 1024
-	chain.utxoCache.cachedEntries.maxTotalMemoryUsage = chain.utxoCache.maxTotalMemoryUsage
 
 	// Read blocks from the file.
 	blocks, err := loadBlocks("blk_0_to_14131.dat")
