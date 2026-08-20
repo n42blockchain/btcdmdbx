@@ -2141,29 +2141,35 @@ func fileExists(name string) bool {
 func initDB(env *mdbx.Env, dbi mdbx.DBI) error {
 	// The starting block file write cursor location is file num 0, offset
 	// 0.
-	tx, err := env.BeginTxn(nil, 0)
+	// Update locks the goroutine to its OS thread, which the engine
+	// requires for a write transaction.  See dbCache.updateDB.
+	err := env.Update(func(tx *mdbx.Txn) error {
+		err := tx.Put(dbi,
+			bucketizedKey(metadataBucketID, writeLocKeyName),
+			serializeWriteRow(0, 0), 0)
+		if err != nil {
+			return err
+		}
+
+		// Create block index bucket and set the current bucket id.
+		//
+		// NOTE: Since buckets are virtualized through the use of prefixes,
+		// there is no need to store the bucket index data for the metadata
+		// bucket in the database.  However, the first bucket ID to use does
+		// need to account for it to ensure there are no key collisions.
+		err = tx.Put(dbi,
+			bucketIndexKey(metadataBucketID, blockIdxBucketName),
+			blockIdxBucketID[:], 0)
+		if err != nil {
+			return err
+		}
+
+		return tx.Put(dbi, curBucketIDKeyName, blockIdxBucketID[:], 0)
+	})
 	if err != nil {
-		return convertErr("failed to open metadata transaction", err)
-	}
-
-	tx.Put(dbi, bucketizedKey(metadataBucketID, writeLocKeyName),
-		serializeWriteRow(0, 0), 0)
-
-	// Create block index bucket and set the current bucket id.
-	//
-	// NOTE: Since buckets are virtualized through the use of prefixes,
-	// there is no need to store the bucket index data for the metadata
-	// bucket in the database.  However, the first bucket ID to use does
-	// need to account for it to ensure there are no key collisions.
-	tx.Put(dbi, bucketIndexKey(metadataBucketID, blockIdxBucketName),
-		blockIdxBucketID[:], 0)
-	tx.Put(dbi, curBucketIDKeyName, blockIdxBucketID[:], 0)
-
-	// Write everything as a single durable transaction.
-	if _, commitErr := tx.Commit(); commitErr != nil {
 		str := fmt.Sprintf("failed to initialize metadata database: %v",
-			commitErr)
-		return convertErr(str, commitErr)
+			err)
+		return convertErr(str, err)
 	}
 
 	return nil

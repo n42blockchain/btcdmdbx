@@ -435,21 +435,19 @@ func (c *dbCache) updateDB(fn func(tx *mdbx.Txn) error) error {
 		return err
 	}
 
-	tx, txErr := c.env.BeginTxn(nil, 0)
-	if txErr != nil {
-		return convertErr("failed to open metadata transaction", txErr)
+	// Update locks the calling goroutine to its OS thread for the
+	// duration of the transaction.  That is required, not merely
+	// tidy: the engine tracks write-transaction ownership in thread
+	// local state, so a goroutine the scheduler moves to another
+	// thread mid-transaction deadlocks when it commits, with the
+	// process going completely idle rather than failing.
+	//
+	// It commits when fn returns nil and aborts otherwise, which is
+	// the contract this function already had.
+	if err := c.env.Update(fn); err != nil {
+		return convertErr("failed to commit metadata transaction", err)
 	}
 
-	if err := fn(tx); err != nil {
-		tx.Abort()
-
-		return err
-	}
-
-	if _, commitErr := tx.Commit(); commitErr != nil {
-		return convertErr("failed to commit metadata transaction",
-			commitErr)
-	}
 	return nil
 }
 
