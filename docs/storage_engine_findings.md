@@ -1,5 +1,13 @@
 # Storage Engine Findings
 
+> **Superseded in part.** Two figures below are wrong: the raw-data
+> total in section 5 was estimated from a biased sample, and the store
+> it was measured on turns out not to be running stock btcd. See
+> `storage_engine_findings_correction.md` for the corrected numbers,
+> the completed mainnet replay, and the resulting decision. The UTXO
+> cache finding, the parallelism results and the synthetic benchmark
+> in sections 1 to 4 are unaffected.
+
 Notes from replacing btcd's metadata store and measuring the result against
 real mainnet data. Written to be useful to another full-node implementation
 facing the same choices, so the reasoning is included rather than just the
