@@ -70,6 +70,9 @@ type config struct {
 	depth       int
 	logPath     string
 	loadOnly    bool
+	censusFrom  int
+	censusTo    int
+	censusWin   int
 }
 
 // logOut is where progress is written, in addition to standard output.
@@ -131,6 +134,14 @@ func parseFlags() *config {
 			"checkpoint")
 	flag.StringVar(&cfg.cpuProfile, "cpuprofile", "",
 		"write a CPU profile to this path")
+	flag.IntVar(&cfg.censusFrom, "census-from", 0,
+		"with --census-to, only count blocks: print transactions, inputs "+
+			"and bytes per window of --census-window blocks, without "+
+			"touching the database.  Normalises rates measured on "+
+			"different height ranges, since blocks differ widely in "+
+			"how much there is to verify")
+	flag.IntVar(&cfg.censusTo, "census-to", 0, "last height to count")
+	flag.IntVar(&cfg.censusWin, "census-window", 3000, "census window size")
 	flag.BoolVar(&cfg.loadOnly, "loadonly", false,
 		"open the database, load the chain state, report how long it "+
 			"took, and exit")
@@ -562,6 +573,10 @@ func run(cfg *config) error {
 	reader, err := newBlockFileReader(cfg.src, params.Net)
 	if err != nil {
 		return err
+	}
+
+	if cfg.censusTo > 0 {
+		return census(reader, cfg.censusFrom, cfg.censusTo, cfg.censusWin)
 	}
 
 	// Reuse an existing database when there is one.  A full mainnet replay
