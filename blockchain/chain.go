@@ -2277,15 +2277,17 @@ func New(config *Config) (*BlockChain, error) {
 		maxRetargetTimespan: targetTimespan * adjustmentFactor,
 		blocksPerRetarget:   int32(targetTimespan / targetTimePerBlock),
 		index:               newBlockIndex(config.DB, params),
-		utxoCache:           newUtxoCache(config.DB, config.UtxoCacheMaxSize),
-		hashCache:           config.HashCache,
-		bestChain:           newChainView(nil),
-		bestHeader:          newChainView(nil),
-		orphans:             make(map[chainhash.Hash]*orphanBlock),
-		prevOrphans:         make(map[chainhash.Hash][]*orphanBlock),
-		warningCaches:       newThresholdCaches(vbNumBits),
-		deploymentCaches:    newThresholdCaches(chaincfg.DefinedDeployments),
-		pruneTarget:         config.Prune,
+		utxoCache: newUtxoCacheWithWorkers(
+			config.DB, config.UtxoCacheMaxSize, config.UtxoApplyWorkers,
+		),
+		hashCache:        config.HashCache,
+		bestChain:        newChainView(nil),
+		bestHeader:       newChainView(nil),
+		orphans:          make(map[chainhash.Hash]*orphanBlock),
+		prevOrphans:      make(map[chainhash.Hash][]*orphanBlock),
+		warningCaches:    newThresholdCaches(vbNumBits),
+		deploymentCaches: newThresholdCaches(chaincfg.DefinedDeployments),
+		pruneTarget:      config.Prune,
 	}
 
 	// Ensure all the deployments are synchronized with our clock if

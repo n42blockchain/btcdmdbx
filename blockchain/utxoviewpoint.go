@@ -542,7 +542,7 @@ func (view *UtxoViewpoint) fetchUtxosFromCache(cache *utxoCache, outpoints []wir
 	// will result in nil entries in the view.  This is intentionally done
 	// so other code can use the presence of an entry in the store as a way
 	// to unnecessarily avoid attempting to reload it from the database.
-	entries, err := cache.fetchEntries(outpoints)
+	entries, err := cache.fetchEntriesParallel(outpoints)
 	if err != nil {
 		return err
 	}
