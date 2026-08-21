@@ -194,6 +194,17 @@ func calcSignatureHash(sigScript []byte, hashType SigHashType, tx *wire.MsgTx, i
 // being spent, in addition to the final transaction fee. In the case the
 // wallet if fed an invalid input amount, the real sighash will differ causing
 // the produced signature to be invalid.
+// p2wpkhScriptCodePrefix and p2wpkhScriptCodeSuffix bracket the 20-byte key
+// hash in the BIP0143 script code for a pay-to-witness-pubkey-hash input.
+var (
+	p2wpkhScriptCodePrefix = []byte{0x19, OP_DUP, OP_HASH160, OP_DATA_20}
+	p2wpkhScriptCodeSuffix = []byte{OP_EQUALVERIFY, OP_CHECKSIG}
+)
+
+// taprootSigMsgReserve is the buffer reservation for a BIP0341 sighash
+// preimage, generous enough that the common cases never grow it.
+const taprootSigMsgReserve = 256
+
 func calcWitnessSignatureHashRaw(subScript []byte, sigHashes *TxSigHashes,
 	hashType SigHashType, tx *wire.MsgTx, idx int, amt int64) ([]byte, error) {
 
@@ -252,14 +263,13 @@ func calcWitnessSignatureHashRaw(subScript []byte, sigHashes *TxSigHashes,
 		if isWitnessPubKeyHashScript(subScript) {
 			// The script code for a p2wkh is a length prefix
 			// varint for the next 25 bytes, followed by a
-			// re-creation of the original p2pkh pk script.
-			w.Write([]byte{0x19})
-			w.Write([]byte{OP_DUP})
-			w.Write([]byte{OP_HASH160})
-			w.Write([]byte{OP_DATA_20})
+			// re-creation of the original p2pkh pk script.  The
+			// constant parts come from package-level slices: a
+			// slice literal handed to an io.Writer escapes to the
+			// heap, which made this six allocations per signature.
+			w.Write(p2wpkhScriptCodePrefix)
 			w.Write(extractWitnessPubKeyHash(subScript))
-			w.Write([]byte{OP_EQUALVERIFY})
-			w.Write([]byte{OP_CHECKSIG})
+			w.Write(p2wpkhScriptCodeSuffix)
 		} else {
 			// For p2wsh outputs, and future outputs, the script
 			// code is the original script, with all code
@@ -469,27 +479,29 @@ func calcTaprootSignatureHashRaw(sigHashes *TxSigHashes, hType SigHashType,
 
 	// We'll utilize this buffer throughout to incrementally calculate
 	// the signature hash for this transaction.
+	// The preimage is a few hundred bytes, so it is reserved up front to
+	// keep the buffer to a single allocation.
 	var sigMsg bytes.Buffer
+	sigMsg.Grow(taprootSigMsgReserve)
 
 	// The final sighash always has a value of 0x00 prepended to it, which
 	// is called the sighash epoch.
 	sigMsg.WriteByte(0x00)
 
 	// First, we write the hash type encoded as a single byte.
-	if err := sigMsg.WriteByte(byte(hType)); err != nil {
-		return nil, err
-	}
+	sigMsg.WriteByte(byte(hType))
 
 	// Next we'll write out the transaction specific data which binds the
-	// outer context of the sighash.
-	err := binary.Write(&sigMsg, binary.LittleEndian, tx.Version)
-	if err != nil {
-		return nil, err
-	}
-	err = binary.Write(&sigMsg, binary.LittleEndian, tx.LockTime)
-	if err != nil {
-		return nil, err
-	}
+	// outer context of the sighash.  The fixed-width fields are encoded
+	// directly; binary.Write goes through reflection and allocates on
+	// every call.
+	var scratch [4]byte
+	binary.LittleEndian.PutUint32(scratch[:], uint32(tx.Version))
+	sigMsg.Write(scratch[:])
+	binary.LittleEndian.PutUint32(scratch[:], tx.LockTime)
+	sigMsg.Write(scratch[:])
+
+	var err error
 
 	// If sighash isn't anyone can pay, then we'll include all the
 	// pre-computed midstate digests in the sighash.

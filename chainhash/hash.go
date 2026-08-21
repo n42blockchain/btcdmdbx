@@ -166,7 +166,9 @@ func TaggedHash(tag []byte, msgs ...[]byte) *Hash {
 	}
 
 	// h = sha256(sha256(tag) || sha256(tag) || msg)
-	h := sha256.New()
+	p := hasherPool.Get().(*pooledHasher)
+	h := p.h
+	h.Reset()
 	h.Write(shaTag[:])
 	h.Write(shaTag[:])
 
@@ -174,13 +176,11 @@ func TaggedHash(tag []byte, msgs ...[]byte) *Hash {
 		h.Write(msg)
 	}
 
-	taggedHash := h.Sum(nil)
+	h.Sum(p.scratch[:0])
+	taggedHash := Hash(p.scratch)
+	hasherPool.Put(p)
 
-	// The function can't error out since the above hash is guaranteed to
-	// be 32 bytes.
-	hash, _ := NewHash(taggedHash)
-
-	return hash
+	return &taggedHash
 }
 
 // NewHashFromStr creates a Hash from a hash string.  The string should be

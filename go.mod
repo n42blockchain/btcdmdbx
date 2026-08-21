@@ -76,3 +76,7 @@ retract (
 	v0.13.0-beta2
 	v0.13.0-beta
 )
+
+replace github.com/btcsuite/btcd/txscript/v2 => ./txscript
+
+replace github.com/btcsuite/btcd/chainhash/v2 => ./chainhash

@@ -225,31 +225,66 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 	for _, tx := range block.Transactions() {
 		numInputs += len(tx.MsgTx().TxIn)
 	}
+	// Compute the BIP0143 and BIP0341 sighash midstates for every witness
+	// transaction before any input is dispatched.
+	//
+	// This used to happen inline, one transaction at a time, under the
+	// hash cache's exclusive lock: the midstates hash the transaction's
+	// prevouts, sequences, outputs, and for taproot the spent amounts and
+	// scripts as well, which is several passes of SHA-256 over every
+	// transaction in the block on the serial path.  They depend only on
+	// the transaction and the read-only utxo view, so they are computed
+	// here across all CPUs.  Entries the hash cache already holds -- from
+	// the mempool, on a serving node -- are reused; nothing is inserted,
+	// since the cache entry for a confirmed transaction was purged at the
+	// end of this function anyway.
+	transactions := block.Transactions()
+	sigHashesByTx := make([]*txscript.TxSigHashes, len(transactions))
+	if segwitActive {
+		workers := runtime.NumCPU()
+		if workers > len(transactions) {
+			workers = len(transactions)
+		}
+
+		var next atomic.Uint64
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				for {
+					i := next.Add(1) - 1
+					if i >= uint64(len(transactions)) {
+						return
+					}
+
+					tx := transactions[i]
+					if !tx.HasWitness() {
+						continue
+					}
+					if hashCache != nil {
+						hashes, ok := hashCache.GetSigHashes(
+							tx.Hash(),
+						)
+						if ok {
+							sigHashesByTx[i] = hashes
+
+							continue
+						}
+					}
+					sigHashesByTx[i] = txscript.NewTxSigHashes(
+						tx.MsgTx(), utxoView,
+					)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
 	txValItems := make([]*txValidateItem, 0, numInputs)
-	for _, tx := range block.Transactions() {
-		hash := tx.Hash()
-
-		// If the HashCache is present, and it doesn't yet contain the
-		// partial sighashes for this transaction, then we add the
-		// sighashes for the transaction. This allows us to take
-		// advantage of the potential speed savings due to the new
-		// digest algorithm (BIP0143).
-		if segwitActive && tx.HasWitness() && hashCache != nil &&
-			!hashCache.ContainsHashes(hash) {
-
-			hashCache.AddSigHashes(tx.MsgTx(), utxoView)
-		}
-
-		var cachedHashes *txscript.TxSigHashes
-		if segwitActive && tx.HasWitness() {
-			if hashCache != nil {
-				cachedHashes, _ = hashCache.GetSigHashes(hash)
-			} else {
-				cachedHashes = txscript.NewTxSigHashes(
-					tx.MsgTx(), utxoView,
-				)
-			}
-		}
+	for txIdx, tx := range transactions {
+		cachedHashes := sigHashesByTx[txIdx]
 
 		for txInIdx, txIn := range tx.MsgTx().TxIn {
 			// Skip coinbases.

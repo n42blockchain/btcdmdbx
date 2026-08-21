@@ -6,6 +6,8 @@
 package chainhash
 
 import (
+	"hash"
+	"sync"
 	"crypto/sha256"
 	"io"
 )
@@ -35,23 +37,42 @@ func DoubleHashH(b []byte) Hash {
 	return Hash(sha256.Sum256(first[:]))
 }
 
-// DoubleHashRaw calculates hash(hash(w)) where w is the resulting bytes from
-// the given serialize function and returns the resulting bytes as a Hash.
+// hasherPool recycles SHA-256 states.  sha256.New returns a heap-allocated
+// digest, and the sighash paths call DoubleHashRaw once per signature from
+// every validation goroutine at once; allocating a fresh digest each time
+// put the allocator's locks on the signature-verification critical path.
+var hasherPool = sync.Pool{
+	New: func() interface{} {
+		return &pooledHasher{h: sha256.New()}
+	},
+}
+
+// pooledHasher pairs a digest with scratch space that already lives on the
+// heap.  Summing into a stack array would force that array to the heap on
+// every call, because the slice crosses an interface boundary; summing into
+// the pooled object's own scratch allocates nothing in steady state.
+type pooledHasher struct {
+	h       hash.Hash
+	scratch [HashSize]byte
+}
+
+// DoubleHashRaw calculates hash(hash(b)) where b is the output of the passed
+// serialize function, and returns the resulting bytes as a Hash.  The
+// serialized data is fed straight into the digest, so it is never
+// materialised as a whole.
 func DoubleHashRaw(serialize func(w io.Writer) error) Hash {
-	// Encode the transaction into the hash.  Ignore the error returns
-	// since the only way the encode could fail is being out of memory
-	// or due to nil pointers, both of which would cause a run-time panic.
-	h := sha256.New()
+	p := hasherPool.Get().(*pooledHasher)
+	h := p.h
+	h.Reset()
 	_ = serialize(h)
 
-	// This buf is here because Sum() will append the result to the passed
-	// in byte slice.  Pre-allocating here saves an allocation on the second
-	// hash as we can reuse it.  This allocation also does not escape to the
-	// heap, saving an allocation.
-	buf := make([]byte, 0, HashSize)
-	first := h.Sum(buf)
+	h.Sum(p.scratch[:0])
 	h.Reset()
-	h.Write(first)
-	res := h.Sum(buf)
-	return *(*Hash)(res)
+	h.Write(p.scratch[:])
+	h.Sum(p.scratch[:0])
+
+	res := Hash(p.scratch)
+	hasherPool.Put(p)
+
+	return res
 }
