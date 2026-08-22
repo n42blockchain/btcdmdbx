@@ -273,6 +273,12 @@ func (p *ConnectPipeline) ProcessBlock(block *btcutil.Block,
 		scripts, err := b.prepareConnectBlock(node, block, view, nil)
 		p.stats.Prepare += time.Since(t2)
 		p.stats.Blocks++
+
+		// The overlay was only needed to load this view; every entry
+		// it supplied has been copied in.  Drop the reference now,
+		// or each view keeps the one before it alive and the chain of
+		// them grows with every block.
+		view.overlay = nil
 		if err != nil {
 			if _, ok := err.(RuleError); ok {
 				b.index.SetStatusFlags(node, statusValidateFailed)

@@ -68,6 +68,7 @@ type config struct {
 	utxoWorkers int
 	pipeline    bool
 	noCheckpts  bool
+	fastBelow   int
 	workers     int
 	depth       int
 	logPath     string
@@ -125,6 +126,10 @@ func parseFlags() *config {
 	flag.IntVar(&cfg.memLimitGB, "memlimit", 112,
 		"soft memory limit in GiB handed to the runtime so a high "+
 			"gogc cannot run the process into the ground")
+	flag.IntVar(&cfg.fastBelow, "fastbelow", 0,
+		"fast-add below this height and validate in full above it, "+
+			"overriding the checkpoint boundary; for measuring a "+
+			"chosen window")
 	flag.BoolVar(&cfg.noCheckpts, "nocheckpoints", false,
 		"build the chain without checkpoints, so every block is "+
 			"validated in full including scripts; for measuring the "+
@@ -663,6 +668,11 @@ func run(cfg *config) error {
 	fastBelow := int32(0)
 	if cfg.fastAdd {
 		fastBelow = lastCheckpoint
+	}
+	if cfg.fastBelow > 0 {
+		// An explicit boundary, for measuring full validation over a
+		// chosen window; it is not a consensus setting.
+		fastBelow = int32(cfg.fastBelow)
 	}
 	logf("fast-add below height %d, full validation above\n",
 		fastBelow)

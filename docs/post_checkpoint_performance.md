@@ -339,3 +339,64 @@ whole study is that above the checkpoint btcd is now ECDSA-bound on a
 16-core desktop, which is where it should be. Shrinking the segment — the
 checkpoint — was worth twenty times more than every constant-factor change
 combined, and it is the one to keep current.
+
+## 7. The rBTC window: 935,001 → 963,350 in full
+
+rBTC's real-block replay (`docs/REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md`
+in that repository) validates 28,350 mainnet blocks — 116,470,186
+transactions, 207,553,666 inputs, 91% of them witness inputs — above an
+AssumeUTXO base at 935,000, every script checked, on this same machine and
+the same block corpus. The replay here counted the same window to the
+transaction (`--census-from=935001 --census-to=963350`), so the two can be
+put side by side. The chainstate at 935,000 was produced by fast-add from
+the 828,000 snapshot (106,000 blocks in 32m43s, 54.5 blocks/s, two cache
+flushes) and kept as `meta_snapshot_935k`; the window was then replayed
+with `--fastbelow=935000 --nocheckpoints --pipeline=true --utxocache=8192
+--gogc=100 --memlimit=48`, alone on the host.
+
+| | rBTC best (MDBX + write-back + fingerprints) | this replay (pipelined) |
+| --- | --- | --- |
+| window wall, chainstate open → tip | 2,314 s | **1,318 s** |
+| + final flush and close | — | 1,400 s |
+| blocks/s | 12.59 | **21.5** (20.3 durable) |
+| transactions/s | 50,340 | **88,400** (83,200 durable) |
+| inputs/s | 89,700 | **157,500** |
+| peak memory | 24.0 GiB working set | 13–27 GB Go heap, 8 GB of it utxo cache |
+| store growth over the window | 93 GB written | 146 → 153 GB |
+| validation | all scripts | all scripts |
+
+Per block the replay's caller loop is accept 2.2 + prepare 16.2 + wait for
+scripts 18.7 + wait for apply 9.4 = 46.5 ms against a 43.7 ms background
+script stage, with fetch at 11.6 ms and the serial checks at 4.6 ms hidden
+inside it. At 7,321 inputs per block the pure signature floor on sixteen
+cores is about 34 ms, so the script stage runs within 30% of it, and the
+rate held between 19 and 24 blocks/s for the whole 22 minutes.
+
+Two runs over this window were thrown away before that one, and each
+taught something the 3,000-block windows could not:
+
+1. **`--gogc=-1` is wrong for long validation runs.** With collection
+   triggered only by the memory limit, GC cost grows with the live heap
+   and the allocation rate at once; the rate slid from 26 to 8 blocks/s
+   over ten minutes as the cache filled, with free memory at 1.9 GB. Normal
+   pacing (`--gogc=100`) under the same limit held the heap between 13
+   and 27 GB and the rate flat. Fast-add never showed this because it
+   allocates little.
+
+2. **The overlay chain was a leak.** Each pipelined view pointed at the
+   previous block's view as its overlay, and that one at its predecessor,
+   so every block's entire viewpoint — a few megabytes — stayed reachable
+   for the rest of the run: the heap climbed 5 → 73 GB in eighteen minutes
+   at `--utxocache=8192`. The overlay is only needed while the view is
+   being loaded, so it is dropped as soon as `prepareConnectBlock` returns.
+   A 3,000-block window leaks 12 GB and shows nothing; the real window was
+   the test.
+
+Against rBTC the comparison is between different designs — an overlay over
+an immutable AssumeUTXO snapshot with a write-back layer, versus a mutable
+MDBX utxo set with an in-memory cache — and rBTC's own notes identify
+validation (`core-validate`, serial per block, ~520–590 s of its 2,314 s)
+as its next target. Its spent-output locality measurement holds here too
+and is worth keeping: 81% of created coins die within one 256-block batch,
+which is exactly what the utxo cache exploits by dropping fresh entries
+that are spent before a flush.
