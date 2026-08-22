@@ -43,9 +43,16 @@ func TestConnectPipeline(t *testing.T) {
 	defer teardownFunc()
 	chain.TstSetCoinbaseMaturity(1)
 
+	// The first block goes in as fast-add, which is how a replay crosses
+	// the checkpoint: the pipeline must apply it before preparing the
+	// next block against the cache.
 	pipe := chain.NewConnectPipeline()
-	for _, block := range blocks[1:] {
-		if err := pipe.ProcessBlock(block, BFNone); err != nil {
+	for i, block := range blocks[1:] {
+		flags := BFNone
+		if i == 0 {
+			flags = BFFastAdd
+		}
+		if err := pipe.ProcessBlock(block, flags); err != nil {
 			t.Fatalf("pipeline ProcessBlock: %v", err)
 		}
 	}

@@ -1111,28 +1111,27 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 	return txFeeInSatoshi, nil
 }
 
-// checkConnectBlock performs several checks to confirm connecting the passed
-// block to the chain represented by the passed view does not violate any rules.
-// In addition, the passed view is updated to spend all of the referenced
-// outputs and add all of the new utxos created by block.  Thus, the view will
-// represent the state of the chain as if the block were actually connected and
-// consequently the best hash for the view is also updated to passed block.
+// connectScripts is what prepareConnectBlock hands to runConnectScripts:
+// whether the scripts are to be run at all, and with which flags.
+type connectScripts struct {
+	run   bool
+	flags txscript.ScriptFlags
+}
+
+// prepareConnectBlock is the first half of checkConnectBlock: every check
+// up to, but not including, script validation.  It loads the inputs into
+// the view, verifies the block-level and transaction-level rules that do
+// not need scripts, and connects the transactions to the view, so that on
+// return the view holds the block's complete delta and the script flags
+// for the second half are known.  It is split out so a caller can run the
+// second half concurrently with the first half of the next block; see
+// ConnectPipeline.
 //
-// An example of some of the checks performed are ensuring connecting the block
-// would not cause any duplicate transaction hashes for old transactions that
-// aren't already fully spent, double spends, exceeding the maximum allowed
-// signature operations per block, invalid values in relation to the expected
-// block subsidy, or fail transaction script validation.
-//
-// The CheckConnectBlockTemplate function makes use of this function to perform
-// the bulk of its work.  The only difference is this function accepts a node
-// which may or may not require reorganization to connect it to the main chain
-// whereas CheckConnectBlockTemplate creates a new node which specifically
-// connects to the end of the current main chain and then calls this function
-// with that node.
-//
-// This function MUST be called with the chain state lock held (for writes).
-func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, view *UtxoViewpoint, stxos *[]SpentTxOut) error {
+// This function MUST be called with the chain state lock held (for writes)
+// unless the view is private to the caller.
+func (b *BlockChain) prepareConnectBlock(node *blockNode, block *btcutil.Block,
+	view *UtxoViewpoint, stxos *[]SpentTxOut) (connectScripts, error) {
+
 	// If the side chain blocks end up in the database, a call to
 	// CheckBlockSanity should be done here in case a previous version
 	// allowed a block that is no longer valid.  However, since the
@@ -1143,13 +1142,13 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// an error now.
 	if node.hash.IsEqual(b.chainParams.GenesisHash) {
 		str := "the coinbase for the genesis block is not spendable"
-		return ruleError(ErrMissingTxOut, str)
+		return connectScripts{}, ruleError(ErrMissingTxOut, str)
 	}
 
 	// Ensure the view is for the node being checked.
 	parentHash := &block.MsgBlock().Header.PrevBlock
 	if !view.BestHash().IsEqual(parentHash) {
-		return AssertError(fmt.Sprintf("inconsistent view when "+
+		return connectScripts{}, AssertError(fmt.Sprintf("inconsistent view when "+
 			"checking block connection: best hash is %v instead "+
 			"of expected %v", view.BestHash(), parentHash))
 	}
@@ -1162,7 +1161,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	if bip0030CheckNeeded(node, b.chainParams) {
 		err := b.checkBIP0030(node, block, view)
 		if err != nil {
-			return err
+			return connectScripts{}, err
 		}
 	}
 
@@ -1174,7 +1173,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	stageStart := time.Now()
 	err := view.fetchInputUtxos(b.utxoCache, block)
 	if err != nil {
-		return err
+		return connectScripts{}, err
 	}
 	stageStart = b.stageStats.mark(&b.stageStats.Fetch, stageStart)
 
@@ -1189,7 +1188,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// the new rules.
 	segwitState, err := b.deploymentState(node.parent, chaincfg.DeploymentSegwit)
 	if err != nil {
-		return err
+		return connectScripts{}, err
 	}
 	enforceSegWit := segwitState == ThresholdActive
 
@@ -1211,7 +1210,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		sigOpCost, err := GetSigOpCost(tx, i == 0, view, enforceBIP0016,
 			enforceSegWit)
 		if err != nil {
-			return err
+			return connectScripts{}, err
 		}
 
 		// Check for overflow or going over the limits.  We have to do
@@ -1222,7 +1221,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 			str := fmt.Sprintf("block contains too many "+
 				"signature operations - got %v, max %v",
 				totalSigOpCost, MaxBlockSigOpsCost)
-			return ruleError(ErrTooManySigOps, str)
+			return connectScripts{}, ruleError(ErrTooManySigOps, str)
 		}
 	}
 
@@ -1238,7 +1237,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		txFee, err := CheckTransactionInputs(tx, node.height, view,
 			b.chainParams)
 		if err != nil {
-			return err
+			return connectScripts{}, err
 		}
 
 		// Sum the total fees and ensure we don't overflow the
@@ -1246,7 +1245,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		lastTotalFees := totalFees
 		totalFees += txFee
 		if totalFees < lastTotalFees {
-			return ruleError(ErrBadFees, "total fees for block "+
+			return connectScripts{}, ruleError(ErrBadFees, "total fees for block "+
 				"overflows accumulator")
 		}
 
@@ -1256,7 +1255,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		// spent txout in the order each transaction spends them.
 		err = view.connectTransaction(tx, node.height, stxos)
 		if err != nil {
-			return err
+			return connectScripts{}, err
 		}
 	}
 
@@ -1275,7 +1274,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		str := fmt.Sprintf("coinbase transaction for block pays %v "+
 			"which is more than expected value of %v",
 			totalSatoshiOut, expectedSatoshiOut)
-		return ruleError(ErrBadCoinbaseValue, str)
+		return connectScripts{}, ruleError(ErrBadCoinbaseValue, str)
 	}
 
 	// Don't run scripts if this node is before the latest known good
@@ -1314,7 +1313,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// the soft-fork deployment is fully active.
 	csvState, err := b.deploymentState(node.parent, chaincfg.DeploymentCSV)
 	if err != nil {
-		return err
+		return connectScripts{}, err
 	}
 	if csvState == ThresholdActive {
 		// If the CSV soft-fork is now active, then modify the
@@ -1337,14 +1336,14 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 			sequenceLock, err := b.calcSequenceLock(node, tx, view,
 				false)
 			if err != nil {
-				return err
+				return connectScripts{}, err
 			}
 			if !SequenceLockActive(sequenceLock, node.height,
 				medianTime) {
 				str := fmt.Sprintf("block contains " +
 					"transaction whose input sequence " +
 					"locks are not met")
-				return ruleError(ErrUnfinalizedTx, str)
+				return connectScripts{}, ruleError(ErrUnfinalizedTx, str)
 			}
 		}
 	}
@@ -1362,7 +1361,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		node.parent, chaincfg.DeploymentTaproot,
 	)
 	if err != nil {
-		return err
+		return connectScripts{}, err
 	}
 	if taprootState == ThresholdActive {
 		scriptFlags |= txscript.ScriptVerifyTaproot
@@ -1372,9 +1371,19 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// transactions are actually allowed to spend the coins by running the
 	// expensive ECDSA signature check scripts.  Doing this last helps
 	// prevent CPU exhaustion attacks.
-	stageStart = b.stageStats.mark(&b.stageStats.Checks, stageStart)
-	if runScripts {
-		err := checkBlockScripts(block, view, scriptFlags, b.sigCache,
+	b.stageStats.mark(&b.stageStats.Checks, stageStart)
+
+	return connectScripts{run: runScripts, flags: scriptFlags}, nil
+}
+
+// runConnectScripts is the second half of checkConnectBlock: the script
+// validation, followed by advancing the view's best hash to the block.
+func (b *BlockChain) runConnectScripts(node *blockNode, block *btcutil.Block,
+	view *UtxoViewpoint, scripts connectScripts) error {
+
+	stageStart := time.Now()
+	if scripts.run {
+		err := checkBlockScripts(block, view, scripts.flags, b.sigCache,
 			b.hashCache)
 		if err != nil {
 			return err
@@ -1387,6 +1396,36 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	view.SetBestHash(&node.hash)
 
 	return nil
+}
+
+// checkConnectBlock performs several checks to confirm connecting the passed
+// block to the chain represented by the passed view does not violate any rules.
+// In addition, the passed view is updated to spend all of the referenced
+// outputs and add all of the new utxos created by block.  Thus, the view will
+// represent the state of the chain as if the block were actually connected and
+// consequently the best hash for the view is also updated to passed block.
+//
+// An example of some of the checks performed are ensuring connecting the block
+// would not cause any duplicate transaction hashes for old transactions that
+// aren't already fully spent, double spends, exceeding the maximum allowed
+// signature operations per block, invalid values in relation to the expected
+// block subsidy, or fail transaction script validation.
+//
+// The CheckConnectBlockTemplate function makes use of this function to perform
+// the bulk of its work.  The only difference is this function accepts a node
+// which may or may not require reorganization to connect it to the main chain
+// whereas CheckConnectBlockTemplate creates a new node which specifically
+// connects to the end of the current main chain and then calls this function
+// with that node.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, view *UtxoViewpoint, stxos *[]SpentTxOut) error {
+	scripts, err := b.prepareConnectBlock(node, block, view, stxos)
+	if err != nil {
+		return err
+	}
+
+	return b.runConnectScripts(node, block, view, scripts)
 }
 
 // CheckConnectBlockTemplate fully validates that connecting the passed block to

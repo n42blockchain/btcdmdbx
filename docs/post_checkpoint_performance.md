@@ -252,18 +252,18 @@ Two lessons from verifying it, both about measurement rather than code:
    have re-issued `BFFastAdd` above the checkpoint. With that fixed, all
    four censuses agree to the entry: 165,976,699.
 
-### 6.3 What the pipeline measured
+### 6.3 What the pipeline measured, twice
 
 Same window, same snapshot, `--fastadd=false --nocheckpoints`, serial and
-pipelined interleaved twice:
+pipelined interleaved. The first pipeline overlapped only the apply:
 
-| run | serial | pipelined |
+| run | serial | pipelined (apply only) |
 | --- | --- | --- |
 | a | 20.9 blocks/s | 21.4 blocks/s |
 | b | 21.0 blocks/s | 20.5 blocks/s |
 
-Flat, within noise. The stage breakdown from the pipelined run says why,
-per block, out of ~47 ms of wall:
+Flat. The stage breakdown from that run says why, per block, out of ~47 ms
+of wall:
 
 | stage | ms/block | on |
 | --- | --- | --- |
@@ -275,14 +275,47 @@ per block, out of ~47 ms of wall:
 | wait for in-flight apply | 0.4 | caller |
 | apply (cache update + commit) | 3.0 | background |
 
-The apply is fully hidden — the caller waited 0.4 ms per block for it — but
-it was only 3 ms to begin with. Everything the pipeline can overlap with the
-script stage is the other ~9 ms of the caller's own work, and the current
-split does not yet do that: the next block's fetch and checks run after this
-block's scripts finish, because both halves live in `checkConnectBlock`.
-Splitting that function so that fetch-and-checks of N+1 (which need only the
-overlay, complete before N's scripts start) runs while N's scripts run would
-hide them, for a ceiling of roughly 47 → 38 ms, about 25 blocks/s.
+The apply was fully hidden — the caller waited 0.4 ms per block for it — but
+it was only 3 ms to begin with. What the pipeline *could* overlap with the
+script stage was the other ~9 ms of the caller's own work, and that needed
+`checkConnectBlock` split in two: `prepareConnectBlock` (fetch, the cheap
+checks, connecting the transactions to the view — after which the view is
+the block's complete delta) and `runConnectScripts`. With the split the
+pipeline runs prepare(N+1) while scripts(N) are on the validators, applies
+N once its scripts pass, and starts scripts(N+1) immediately:
+
+| run | serial | pipelined (prepare ∥ scripts) |
+| --- | --- | --- |
+| a | 20.9 blocks/s | **25.0 blocks/s** |
+| b | 21.0 blocks/s | **24.1 blocks/s** † |
+
+† taken while seven unrelated processes held 44 GB of RAM; see below.
+
+Per block, from the clean run:
+
+| stage | ms/block | on |
+| --- | --- | --- |
+| accept | 1.9 | caller |
+| prepare (fetch 9.3 + checks 4.3) | 13.6 | caller, ∥ scripts(N−1) |
+| wait for scripts(N−1) | 18.4 | caller |
+| wait for apply | 6.1 | caller |
+| **scripts** | **39.3** | background |
+| apply | 6.0 | background |
+
+The caller's loop is 1.9 + 13.6 + 18.4 + 6.1 = 40 ms, the script stage is
+39.3 ms: the replay is now bound by script validation and nothing else.
+Prepare and apply are slower than when measured alone (4.5 → 9.3 and
+3.0 → 6.0 ms) because they share the cores with the validators, but they
+are off the critical path, so that costs nothing.
+
+The second pair was contaminated — 44 GB of RAM taken by other processes
+evicted most of the 106 GB store from the page cache — and that accident
+measured something worth keeping: the serial replay fell from 21.0 to 15.5
+blocks/s (its fetch stage now paid for disk reads) while the pipelined one
+fell only from 25.0 to 24.1. Its fetch stage doubled to 19.6 ms, and the
+wait for the previous block's scripts shrank by the same amount. The
+pipeline hides utxo I/O as well as it hides the cache apply, which matters
+more on a node whose utxo set does not fit in memory than it does here.
 
 ### 6.4 The floor
 
@@ -291,10 +324,10 @@ pipelined run, signature verification alone (`ecdsa.Verify` + `schnorrVerify`)
 accounted for 523 s of samples over a 60-second window at 21.4 blocks/s: about
 0.41 core-seconds per block, or 25 ms of the machine's 16 physical cores.
 All validator work together was 0.49 core-seconds per block, 31 ms across
-16 cores; the stage's measured 37 ms wall is therefore within 20% of perfect
-spread, and the residue is the per-block join and the tail of the longest
-transaction. This machine's floor for this window is 32–40 blocks/s; the
-replay runs at 21.4, with a clear path to ~25.
+16 cores; the stage's measured 37–39 ms wall is therefore within 20% of
+perfect spread, and the residue is the per-block join and the tail of the
+longest transaction. This machine's floor for this window is 32–40 blocks/s;
+the replay runs at 25.
 
 The rest of the gap is arithmetic on the curve, and the honest summary of the
 whole study is that above the checkpoint btcd is now ECDSA-bound on a
