@@ -288,8 +288,13 @@ N once its scripts pass, and starts scripts(N+1) immediately:
 | --- | --- | --- |
 | a | 20.9 blocks/s | **25.0 blocks/s** |
 | b | 21.0 blocks/s | **24.1 blocks/s** † |
+| c | 18.8 blocks/s † | **24.4 blocks/s** † |
+| d | 19.6 blocks/s † | **24.3 blocks/s** † |
 
 † taken while seven unrelated processes held 44 GB of RAM; see below.
+Under that load the pipelined replay is 24.1–24.4 against a serial
+15.5–19.6, and the serial spread itself is the page cache warming back
+up between runs.
 
 Per block, from the clean run:
 
