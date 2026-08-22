@@ -551,6 +551,10 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
 	for i := range s.cachedEntries.shards {
 		shard := &s.cachedEntries.shards[i]
+
+		// A block being validated ahead of this flush may be reading
+		// the cache concurrently; hold the shard while it is walked.
+		shard.mtx.Lock()
 		for outpoint, entry := range shard.m {
 			switch {
 			// If the entry is nil or spent, remove the entry from the database
@@ -573,6 +577,7 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 
 			delete(shard.m, outpoint)
 		}
+		shard.mtx.Unlock()
 	}
 	s.cachedEntries.deleteMaps()
 	atomic.StoreUint64(&s.totalEntryMemory, 0)

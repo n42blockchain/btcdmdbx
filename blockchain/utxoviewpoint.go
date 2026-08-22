@@ -158,6 +158,12 @@ func NewUtxoEntry(
 // The unspent outputs are needed by other transactions for things such as
 // script validation and double spend prevention.
 type UtxoViewpoint struct {
+	// overlay, when set, is consulted before the cache by fetches.  It holds
+	// the delta of a block that has been validated but not yet applied to
+	// the cache, so the next block can be validated against the state the
+	// chain will have once that application lands; see ConnectPipeline.
+	overlay *UtxoViewpoint
+
 	entries  map[wire.OutPoint]*UtxoEntry
 	bestHash chainhash.Hash
 }
@@ -542,6 +548,24 @@ func (view *UtxoViewpoint) fetchUtxosFromCache(cache *utxoCache, outpoints []wir
 	// will result in nil entries in the view.  This is intentionally done
 	// so other code can use the presence of an entry in the store as a way
 	// to unnecessarily avoid attempting to reload it from the database.
+	// Anything the overlay knows about takes precedence over the cache,
+	// since the overlay is strictly newer.
+	if view.overlay != nil {
+		remaining := make([]wire.OutPoint, 0, len(outpoints))
+		for _, op := range outpoints {
+			if entry, ok := view.overlay.entries[op]; ok {
+				view.entries[op] = entry.Clone()
+
+				continue
+			}
+			remaining = append(remaining, op)
+		}
+		outpoints = remaining
+		if len(outpoints) == 0 {
+			return nil
+		}
+	}
+
 	entries, err := cache.fetchEntriesParallel(outpoints)
 	if err != nil {
 		return err

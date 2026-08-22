@@ -5,6 +5,7 @@
 package blockchain
 
 import (
+	"sync"
 	"fmt"
 	"time"
 
@@ -112,20 +113,25 @@ type thresholdConditionChecker interface {
 // thresholdStateCache provides a type to cache the threshold states of each
 // threshold window for a set of IDs.
 type thresholdStateCache struct {
+	mtx     sync.RWMutex
 	entries map[chainhash.Hash]ThresholdState
 }
 
 // Lookup returns the threshold state associated with the given hash along with
 // a boolean that indicates whether or not it is valid.
 func (c *thresholdStateCache) Lookup(hash *chainhash.Hash) (ThresholdState, bool) {
+	c.mtx.RLock()
 	state, ok := c.entries[*hash]
+	c.mtx.RUnlock()
 	return state, ok
 }
 
 // Update updates the cache to contain the provided hash to threshold state
 // mapping.
 func (c *thresholdStateCache) Update(hash *chainhash.Hash, state ThresholdState) {
+	c.mtx.Lock()
 	c.entries[*hash] = state
+	c.mtx.Unlock()
 }
 
 // newThresholdCaches returns a new array of caches to be used when calculating

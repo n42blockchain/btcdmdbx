@@ -22,17 +22,26 @@ import (
 // their documentation for how the flags modify their behavior.
 //
 // This function MUST be called with the chain state lock held (for writes).
-func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags) (bool, error) {
+// acceptBlockNoConnect performs the context-dependent checks on a block,
+// stores it, and adds it to the block index, but stops short of connecting
+// it to the chain.  It is the first half of maybeAcceptBlock, split out so a
+// caller can validate the transactions off the chain lock before
+// connecting; see ConnectPipeline.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) acceptBlockNoConnect(block *btcutil.Block,
+	flags BehaviorFlags) (*blockNode, error) {
+
 	// The height of this block is one more than the referenced previous
 	// block.
 	prevHash := &block.MsgBlock().Header.PrevBlock
 	prevNode := b.index.LookupNode(prevHash)
 	if prevNode == nil {
 		str := fmt.Sprintf("previous block %s is unknown", prevHash)
-		return false, ruleError(ErrPreviousBlockUnknown, str)
+		return nil, ruleError(ErrPreviousBlockUnknown, str)
 	} else if b.index.NodeStatus(prevNode).KnownInvalid() {
 		str := fmt.Sprintf("previous block %s is known to be invalid", prevHash)
-		return false, ruleError(ErrInvalidAncestorBlock, str)
+		return nil, ruleError(ErrInvalidAncestorBlock, str)
 	}
 
 	blockHeight := prevNode.height + 1
@@ -42,7 +51,7 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// position of the block within the block chain.
 	err := b.checkBlockContext(block, prevNode, flags)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	// Insert the block into the database if it's not already there.  Even
@@ -58,7 +67,7 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		return dbStoreBlock(dbTx, block)
 	})
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	// Create a new block node for the block and add it to the node index. Even
@@ -80,12 +89,21 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	}
 	err = b.index.flushToDB()
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	// Connect the passed block to the chain while respecting proper chain
 	// selection according to the chain with the most proof of work.  This
 	// also handles validation of the transaction scripts.
+	return newNode, nil
+}
+
+func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags) (bool, error) {
+	newNode, err := b.acceptBlockNoConnect(block, flags)
+	if err != nil {
+		return false, err
+	}
+
 	isMainChain, err := b.connectBestChain(newNode, block, flags)
 	if err != nil {
 		return false, err

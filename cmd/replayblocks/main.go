@@ -66,6 +66,8 @@ type config struct {
 	sigCache    int
 	pprofAddr   string
 	utxoWorkers int
+	pipeline    bool
+	noCheckpts  bool
 	workers     int
 	depth       int
 	logPath     string
@@ -123,6 +125,14 @@ func parseFlags() *config {
 	flag.IntVar(&cfg.memLimitGB, "memlimit", 112,
 		"soft memory limit in GiB handed to the runtime so a high "+
 			"gogc cannot run the process into the ground")
+	flag.BoolVar(&cfg.noCheckpts, "nocheckpoints", false,
+		"build the chain without checkpoints, so every block is "+
+			"validated in full including scripts; for measuring the "+
+			"validation path on heights a checkpoint would otherwise "+
+			"cover")
+	flag.BoolVar(&cfg.pipeline, "pipeline", true,
+		"above the checkpoint, validate each block while the previous "+
+			"one is being applied and committed")
 	flag.IntVar(&cfg.utxoWorkers, "utxoworkers", 12,
 		"goroutines applying a block's utxo changes to the cache; the "+
 			"work is DRAM-latency bound, so this scales with memory "+
@@ -604,6 +614,11 @@ func run(cfg *config) error {
 
 	timeSource := blockchain.NewMedianTime()
 
+	checkpoints := params.Checkpoints
+	if cfg.noCheckpts {
+		checkpoints = nil
+	}
+
 	openStart := time.Now()
 	chain, err := blockchain.New(&blockchain.Config{
 		DB:          db,
@@ -615,7 +630,7 @@ func run(cfg *config) error {
 		// hash pinning silently never runs.  It is the anchor that
 		// makes fast-add below the checkpoint safe, so it is not
 		// optional.
-		Checkpoints: params.Checkpoints,
+		Checkpoints: checkpoints,
 
 		// Full validation above the checkpoint fans signature checks
 		// out across NumCPU*3 goroutines; these caches are what make
@@ -652,6 +667,22 @@ func run(cfg *config) error {
 	logf("fast-add below height %d, full validation above\n",
 		fastBelow)
 
+	// Above the checkpoint each block is validated while the previous one
+	// is applied; Flush waits for the last apply so its error is not
+	// lost and the chain is quiescent before the cache is flushed.
+	pipe := chain.NewConnectPipeline()
+	flushPipeline := func() error {
+		if !cfg.pipeline {
+			return nil
+		}
+
+		return pipe.Flush()
+	}
+
+	// Drain on every exit path, before the deferred database close runs,
+	// so an apply still in flight cannot outlive the store it writes to.
+	defer func() { _ = flushPipeline() }()
+
 	mode := "fast-add below checkpoint, full validation above"
 	if !cfg.fastAdd {
 		mode = "full validation at every height"
@@ -683,6 +714,11 @@ func run(cfg *config) error {
 
 	var processed, skipped int64
 	var lastProcessed int64
+
+	// The height of the last block handed to the chain.  With the
+	// pipeline the tip lags one block behind, so the tip cannot be used
+	// to decide what the next block is or when to stop.
+	fedHeight := chain.BestSnapshot().Height
 
 	// Per-stage totals.  Which stage dominates decides what is worth
 	// parallelising, so it is measured rather than assumed.
@@ -722,13 +758,18 @@ func run(cfg *config) error {
 
 		// Sanity ran in the pipeline workers already.
 		flags := blockchain.BFSanityDone
-		nextHeight := chain.BestSnapshot().Height + 1
+		nextHeight := fedHeight + 1
 		if nextHeight <= fastBelow {
 			flags |= blockchain.BFFastAdd
 		}
 
 		stageStart = time.Now()
-		_, isOrphan, err := chain.ProcessBlock(block, flags)
+		var isOrphan bool
+		if cfg.pipeline && flags&blockchain.BFFastAdd == 0 {
+			err = pipe.ProcessBlock(block, flags)
+		} else {
+			_, isOrphan, err = chain.ProcessBlock(block, flags)
+		}
 		processTime += time.Since(stageStart)
 		if err != nil {
 			// A block the chain already has means this run is
@@ -738,19 +779,20 @@ func run(cfg *config) error {
 				ruleErr.ErrorCode == blockchain.ErrDuplicateBlock {
 
 				skipped++
+				fedHeight = chain.BestSnapshot().Height
 
 				continue
 			}
 
 			return fmt.Errorf("failed to process block %s at "+
-				"height %d: %w", block.Hash(),
-				chain.BestSnapshot().Height+1, err)
+				"height %d: %w", block.Hash(), nextHeight, err)
 		}
 		if isOrphan {
 			return fmt.Errorf("block %s is an orphan; the source "+
 				"files are not in chain order", block.Hash())
 		}
 		processed++
+		fedHeight = nextHeight
 
 		if now := time.Now(); now.Sub(lastReport) >= reportEvery {
 			best := chain.BestSnapshot()
@@ -768,11 +810,16 @@ func run(cfg *config) error {
 			lastProcessed = processed
 		}
 
-		if cfg.maxHeight > 0 &&
-			chain.BestSnapshot().Height >= int32(cfg.maxHeight) {
+		if cfg.maxHeight > 0 && fedHeight >= int32(cfg.maxHeight) {
 
 			break
 		}
+	}
+
+	// Drain the pipeline before the tip is read: the last block is still
+	// pending until then.
+	if err := flushPipeline(); err != nil {
+		return fmt.Errorf("pipeline: %w", err)
 	}
 
 	best := chain.BestSnapshot()
@@ -812,6 +859,22 @@ func run(cfg *config) error {
 	logf("  average rate     %.1f blocks/s\n",
 		float64(processed)/elapsed.Seconds())
 	logf("  metadata size    %.3f GB\n", float64(meta)/(1<<30))
+	if ps := pipe.Stats(); cfg.pipeline && ps.Blocks > 0 {
+		per := func(d time.Duration) string {
+			return fmt.Sprintf("%8s  %6.1f ms/block", d.Truncate(time.Second),
+				float64(d.Microseconds())/1000/float64(ps.Blocks))
+		}
+		logf("  pipeline blocks  %d\n", ps.Blocks)
+		logf("  accept           %s\n", per(ps.Accept))
+		logf("  validate         %s\n", per(ps.Validate))
+		logf("  wait apply       %s\n", per(ps.WaitApply))
+		logf("  apply lock wait  %s\n", per(ps.ApplyLock))
+		logf("  apply            %s\n", per(ps.Apply))
+		ss := chain.ConnectStageStats()
+		logf("   fetch inputs    %s\n", per(time.Duration(ss.Fetch)))
+		logf("   serial checks   %s\n", per(time.Duration(ss.Checks)))
+		logf("   scripts         %s\n", per(time.Duration(ss.Scripts)))
+	}
 	totalStage := waitTime + processTime
 	if totalStage > 0 {
 		// Waiting on the pipeline is the read, checksum and parse cost

@@ -1,7 +1,8 @@
 # Post-Checkpoint Validation Performance
 
 Research notes on the segment of a mainnet replay above btcd's last
-checkpoint (height 810,000 in `chaincfg/params.go`), where every consensus
+checkpoint (height 810,000 in `chaincfg/params.go` when the study began;
+950,000 since section 6), where every consensus
 rule runs including script validation. Below the checkpoint the replay runs
 at 300–2,800 blocks/s; above it the measured rate was 11.8–13.7 blocks/s, a
 gap of two orders of magnitude that deserved a proper accounting rather than
@@ -197,25 +198,106 @@ the profile — but they reduced CPU burn, not wall time, because wall time was
 never bound there. On a machine with fewer cores it would have been, and the
 changes stand on their own; on this one they are hygiene.
 
-## 6. What is left, and the one lever that dwarfs the rest
+## 6. The two levers, pulled
 
-With the fetch parallelised the connect goroutine is on CPU for a sixth of
-wall time and the validators for about sixteen cores' worth, on a 32-core
-machine. The gap to full utilisation is structural: every block is a barrier.
-Four fan-outs — sighash midstates, input fetch, script checks, cache apply —
-each spawn workers, run, and join before the next stage starts, and the
-`semasleep` share is those joins. The next step is cross-block pipelining:
-fetching and script-checking block N+1 while block N's cache apply and commit
-run, which is how the sub-checkpoint path already overlaps its stages. That
-is a change to `connectBestChain`'s structure rather than to any one stage,
-and it is the right next project.
+Section 5 left two items: a newer checkpoint, and overlapping consecutive
+blocks. Both are now in the tree. One did what was predicted; the other
+measured flat, and the measurement of *why* is the useful part.
 
-The lever that dwarfs all of this is policy, not code. The full-validation
-segment is 810,000 → tip, ~153,000 blocks, because upstream btcd's
-checkpoint list stops at 810,000. Bitcoin Core ships `assumevalid` at roughly
-height 905,000 in current releases on exactly the trust model btcd's
-checkpoints embody. A checkpoint at 950,000, with the hash taken from a node
-that fully validated it, shrinks the segment to ~13,000 blocks — **twenty
-times less work than any constant-factor gain can deliver**. That is an
-operator trust decision rather than an engineering one, and it is recorded
-here rather than made.
+### 6.1 Checkpoint at 950,000
+
+`chaincfg/params.go` now ends the mainnet list at height 950,000, hash
+`000000000000000000010b93c9ea1c29fea277383f0f7d1f26de8b5802e885ff`, read
+from the block files of a node that validated it in full and cross-checked
+against two independent sources. The full-validation segment shrinks from
+~153,000 blocks to ~13,000 — at the rates below, about ten minutes instead of
+two hours. Nothing else in this section comes close.
+
+Note for anyone measuring script validation on heights the checkpoint now
+covers: `checkConnectBlock` sets `runScripts = false` for every height at or
+below the latest checkpoint regardless of `--fastadd=false`, so the replay
+grew a `--nocheckpoints` flag. Every number below was taken with it.
+
+### 6.2 Cross-block pipeline
+
+`blockchain.ConnectPipeline` splits `ProcessBlock` in two. The block is
+checked, stored and indexed under the chain lock (`acceptBlockNoConnect`),
+validated off the lock against an *overlay* — the previous block's viewpoint,
+which is exactly its delta — and only then applied, in a goroutine, while the
+next block is being validated. `UtxoViewpoint.overlay` makes fetches consult
+the delta before the cache; the cache's shards, the block index, the
+threshold-state cache and the flush all carry their own locks for the
+concurrent reader.
+
+Two lessons from verifying it, both about measurement rather than code:
+
+1. **The first version did not overlap anything.** It waited for the
+   in-flight apply at the *top* of `ProcessBlock`, then accepted, validated
+   and spawned the next apply — so the apply always ran alongside the
+   caller's read of the next block, never alongside validation. The fix
+   reorders the stages: accept N+1, *then* start apply(N), then validate
+   N+1. A wall-clock stage breakdown (`PipelineStats`) now ships with the
+   pipeline so this cannot go unnoticed again.
+
+2. **Equivalence must be checked on the store, not the tip.** Four runs over
+   the same restored snapshot (828,000 → 831,000, serial and pipelined,
+   interleaved) first disagreed by 599 entries: the pipelined store had one
+   extra block. The replay's stop condition read the chain tip, which lags
+   the pipeline by one block, so the pipeline fed 831,001 before stopping. A
+   key-level merge diff of the two 166-million-entry stores attributed every
+   differing key to that block (its index and height entries, its undo
+   journal, 6,483 inputs spent, 7,077 outputs created). The replay now
+   tracks the height it has *fed* rather than the tip — which also closes a
+   one-block hole at the checkpoint boundary where the lagging tip could
+   have re-issued `BFFastAdd` above the checkpoint. With that fixed, all
+   four censuses agree to the entry: 165,976,699.
+
+### 6.3 What the pipeline measured
+
+Same window, same snapshot, `--fastadd=false --nocheckpoints`, serial and
+pipelined interleaved twice:
+
+| run | serial | pipelined |
+| --- | --- | --- |
+| a | 20.9 blocks/s | 21.4 blocks/s |
+| b | 21.0 blocks/s | 20.5 blocks/s |
+
+Flat, within noise. The stage breakdown from the pipelined run says why,
+per block, out of ~47 ms of wall:
+
+| stage | ms/block | on |
+| --- | --- | --- |
+| accept (store, index) | 1.6 | caller, under lock |
+| validate = `checkConnectBlock` | 44.7 | caller, off lock |
+|   fetch inputs | 4.5 | |
+|   serial per-tx checks (sigops, fees, sequence locks) | 3.1 | |
+|   **scripts** | **37.1** | validators |
+| wait for in-flight apply | 0.4 | caller |
+| apply (cache update + commit) | 3.0 | background |
+
+The apply is fully hidden — the caller waited 0.4 ms per block for it — but
+it was only 3 ms to begin with. Everything the pipeline can overlap with the
+script stage is the other ~9 ms of the caller's own work, and the current
+split does not yet do that: the next block's fetch and checks run after this
+block's scripts finish, because both halves live in `checkConnectBlock`.
+Splitting that function so that fetch-and-checks of N+1 (which need only the
+overlay, complete before N's scripts start) runs while N's scripts run would
+hide them, for a ceiling of roughly 47 → 38 ms, about 25 blocks/s.
+
+### 6.4 The floor
+
+Above that, the script stage is the block. From the CPU profile of the
+pipelined run, signature verification alone (`ecdsa.Verify` + `schnorrVerify`)
+accounted for 523 s of samples over a 60-second window at 21.4 blocks/s: about
+0.41 core-seconds per block, or 25 ms of the machine's 16 physical cores.
+All validator work together was 0.49 core-seconds per block, 31 ms across
+16 cores; the stage's measured 37 ms wall is therefore within 20% of perfect
+spread, and the residue is the per-block join and the tail of the longest
+transaction. This machine's floor for this window is 32–40 blocks/s; the
+replay runs at 21.4, with a clear path to ~25.
+
+The rest of the gap is arithmetic on the curve, and the honest summary of the
+whole study is that above the checkpoint btcd is now ECDSA-bound on a
+16-core desktop, which is where it should be. Shrinking the segment — the
+checkpoint — was worth twenty times more than every constant-factor change
+combined, and it is the one to keep current.

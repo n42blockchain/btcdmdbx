@@ -1171,10 +1171,12 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	//
 	// These utxo entries are needed for verification of things such as
 	// transaction inputs, counting pay-to-script-hashes, and scripts.
+	stageStart := time.Now()
 	err := view.fetchInputUtxos(b.utxoCache, block)
 	if err != nil {
 		return err
 	}
+	stageStart = b.stageStats.mark(&b.stageStats.Fetch, stageStart)
 
 	// BIP0016 describes a pay-to-script-hash type that is considered a
 	// "standard" type.  The rules for this BIP only apply to transactions
@@ -1370,6 +1372,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// transactions are actually allowed to spend the coins by running the
 	// expensive ECDSA signature check scripts.  Doing this last helps
 	// prevent CPU exhaustion attacks.
+	stageStart = b.stageStats.mark(&b.stageStats.Checks, stageStart)
 	if runScripts {
 		err := checkBlockScripts(block, view, scriptFlags, b.sigCache,
 			b.hashCache)
@@ -1377,6 +1380,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 			return err
 		}
 	}
+	b.stageStats.mark(&b.stageStats.Scripts, stageStart)
 
 	// Update the best hash for view to include this block since all of its
 	// transactions have been connected.

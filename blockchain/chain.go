@@ -6,6 +6,7 @@
 package blockchain
 
 import (
+	"sync/atomic"
 	"container/list"
 	"fmt"
 	"sync"
@@ -90,7 +91,37 @@ func newBestState(node *blockNode, blockSize, blockWeight, numTxns,
 // It includes functionality such as rejecting duplicate blocks, ensuring blocks
 // follow all rules, orphan handling, checkpoint handling, and best chain
 // selection with reorganization.
+// ConnectStageStats accumulates, in nanoseconds, the wall time
+// checkConnectBlock spent in each of its stages: fetching the inputs from
+// the utxo cache and database, the serial per-transaction checks, and the
+// parallel script validation.  It exists so the split can be measured on
+// a real replay instead of inferred from a profile.
+type ConnectStageStats struct {
+	Fetch   int64
+	Checks  int64
+	Scripts int64
+}
+
+// mark adds the time since start to the counter and returns now.
+func (s *ConnectStageStats) mark(counter *int64, start time.Time) time.Time {
+	now := time.Now()
+	atomic.AddInt64(counter, int64(now.Sub(start)))
+	return now
+}
+
+// ConnectStageStats returns a snapshot of the connect stage timers.
+func (b *BlockChain) ConnectStageStats() ConnectStageStats {
+	return ConnectStageStats{
+		Fetch:   atomic.LoadInt64(&b.stageStats.Fetch),
+		Checks:  atomic.LoadInt64(&b.stageStats.Checks),
+		Scripts: atomic.LoadInt64(&b.stageStats.Scripts),
+	}
+}
+
 type BlockChain struct {
+	// stageStats times the stages of checkConnectBlock.
+	stageStats ConnectStageStats
+
 	// The following fields are set when the instance is created and can't
 	// be changed afterwards, so there is no need to protect them with a
 	// separate mutex.
