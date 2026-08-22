@@ -71,6 +71,7 @@ type config struct {
 	logPath     string
 	loadOnly    bool
 	censusFrom  int
+	hashAt      int
 	censusTo    int
 	censusWin   int
 }
@@ -134,6 +135,8 @@ func parseFlags() *config {
 			"checkpoint")
 	flag.StringVar(&cfg.cpuProfile, "cpuprofile", "",
 		"write a CPU profile to this path")
+	flag.IntVar(&cfg.hashAt, "hash-at", 0,
+		"print the hash of the block at this height and exit")
 	flag.IntVar(&cfg.censusFrom, "census-from", 0,
 		"with --census-to, only count blocks: print transactions, inputs "+
 			"and bytes per window of --census-window blocks, without "+
@@ -577,6 +580,9 @@ func run(cfg *config) error {
 
 	if cfg.censusTo > 0 {
 		return census(reader, cfg.censusFrom, cfg.censusTo, cfg.censusWin)
+	}
+	if cfg.hashAt > 0 {
+		return hashAt(reader, cfg.hashAt)
 	}
 
 	// Reuse an existing database when there is one.  A full mainnet replay

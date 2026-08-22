@@ -80,3 +80,5 @@ retract (
 replace github.com/btcsuite/btcd/txscript/v2 => ./txscript
 
 replace github.com/btcsuite/btcd/chainhash/v2 => ./chainhash
+
+replace github.com/btcsuite/btcd/chaincfg/v2 => ./chaincfg

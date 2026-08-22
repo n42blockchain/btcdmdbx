@@ -79,3 +79,28 @@ func census(reader *blockFileReader, from, to, window int) error {
 
 	return nil
 }
+
+// hashAt prints the hash and header of the block at the given height, taking
+// the record ordinal as the height, so a checkpoint candidate can be read
+// straight out of a fully validated node's block files.
+func hashAt(reader *blockFileReader, height int) error {
+	if _, err := reader.skip(height); err != nil {
+		return err
+	}
+	raw, err := reader.next()
+	if err != nil {
+		return err
+	}
+	if raw == nil {
+		return fmt.Errorf("corpus ends before height %d", height)
+	}
+	block, err := btcutil.NewBlockFromBytes(raw)
+	if err != nil {
+		return err
+	}
+	hdr := block.MsgBlock().Header
+	fmt.Printf("height %d\nhash   %s\nprev   %s\ntime   %s\n", height,
+		block.Hash(), hdr.PrevBlock, hdr.Timestamp.UTC().Format("2006-01-02 15:04:05"))
+
+	return nil
+}

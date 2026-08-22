@@ -372,6 +372,13 @@ var MainNetParams = Params{
 		{781565, newHashFromStr("00000000000000000002b8c04999434c33b8e033f11a977b288f8411766ee61c")},
 		{800000, newHashFromStr("00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054")},
 		{810000, newHashFromStr("000000000000000000028028ca82b6aa81ce789e4eb9e0321b74c3cbaf405dd1")},
+
+		// Height 950,000 (2026-05-18).  Read from a fully validated
+		// local node and cross-checked against two independent public
+		// explorers before being pinned; it moves the fast-add boundary
+		// forward so that a sync validates scripts only for the blocks
+		// above it, on the same trust model as every entry before it.
+		{950000, newHashFromStr("000000000000000000010b93c9ea1c29fea277383f0f7d1f26de8b5802e885ff")},
 	},
 
 	// Consensus rule change deployments.
