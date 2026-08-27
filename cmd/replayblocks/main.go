@@ -20,7 +20,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -72,11 +74,70 @@ type config struct {
 	workers     int
 	depth       int
 	logPath     string
+	jsonPath    string
 	loadOnly    bool
 	censusFrom  int
 	hashAt      int
 	censusTo    int
 	censusWin   int
+}
+
+// replayReport is the machine-readable evidence for a replay run.  Connect
+// time ends once the validation pipeline is drained.  Durable time also
+// includes the required UTXO flush and closing the metadata store, so the
+// resulting database can be reopened at final_height.
+type replayReport struct {
+	SchemaVersion int `json:"schema_version"`
+
+	BenchmarkRevision   string `json:"benchmark_revision"`
+	MeasurementRevision string `json:"measurement_revision"`
+
+	SourceFileCount      int    `json:"source_file_count"`
+	SourceLogicalBytes   int64  `json:"source_logical_bytes"`
+	SourceManifestSHA256 string `json:"source_manifest_sha256"`
+
+	StartHeight            int32  `json:"start_height"`
+	StartHash              string `json:"start_hash"`
+	StartTotalTransactions uint64 `json:"start_total_transactions"`
+	FinalHeight            int32  `json:"final_height"`
+	FinalHash              string `json:"final_hash"`
+	FinalTotalTransactions uint64 `json:"final_total_transactions"`
+
+	BlocksReplayed       int64  `json:"blocks_replayed"`
+	TransactionsReplayed uint64 `json:"transactions_replayed"`
+	BlocksSkipped        int64  `json:"blocks_skipped"`
+
+	FastAddCheckpointHeight      int32   `json:"fastadd_checkpoint_height"`
+	FastAddCheckpointHash        string  `json:"fastadd_checkpoint_hash"`
+	FastAddBlocks                int64   `json:"fastadd_blocks"`
+	FastAddTransactions          uint64  `json:"fastadd_transactions"`
+	FastAddElapsedSeconds        float64 `json:"fastadd_elapsed_seconds"`
+	FullValidationBlocks         int64   `json:"full_validation_blocks"`
+	FullValidationTransactions   uint64  `json:"full_validation_transactions"`
+	FullValidationElapsedSeconds float64 `json:"full_validation_elapsed_seconds"`
+
+	ConnectElapsedSeconds float64 `json:"connect_elapsed_seconds"`
+	FlushElapsedSeconds   float64 `json:"flush_elapsed_seconds"`
+	CloseElapsedSeconds   float64 `json:"close_elapsed_seconds"`
+	DurableElapsedSeconds float64 `json:"durable_elapsed_seconds"`
+	ProcessWallSeconds    float64 `json:"process_wall_seconds"`
+
+	AverageConnectTPS      float64 `json:"average_connect_tps"`
+	AverageDurableTPS      float64 `json:"average_durable_tps"`
+	AverageBlocksPerSecond float64 `json:"average_blocks_per_second"`
+
+	UtxoCacheMiB int `json:"utxo_cache_mib"`
+	ParseWorkers int `json:"parse_workers"`
+	UtxoWorkers  int `json:"utxo_workers"`
+	Depth        int `json:"depth"`
+	GOGC         int `json:"gogc"`
+	MemLimitGiB  int `json:"memlimit_gib"`
+	SigCache     int `json:"sigcache"`
+
+	MetadataBytes      int64  `json:"metadata_bytes"`
+	TotalDatabaseBytes int64  `json:"total_database_bytes"`
+	PeakRSSBytes       uint64 `json:"peak_rss_bytes"`
+	ExitCode           int    `json:"exit_code"`
 }
 
 // logOut is where progress is written, in addition to standard output.
@@ -165,6 +226,8 @@ func parseFlags() *config {
 			"took, and exit")
 	flag.StringVar(&cfg.logPath, "log", "",
 		"also write progress to this file, flushed after every line")
+	flag.StringVar(&cfg.jsonPath, "json", "",
+		"write a machine-readable durable replay report to this file")
 	flag.IntVar(&cfg.workers, "workers", runtime.NumCPU()/4,
 		"goroutines deserializing blocks ahead of the connect loop")
 	flag.IntVar(&cfg.depth, "depth", 1024,
@@ -547,6 +610,68 @@ func dirSize(dir string) int64 {
 	return total
 }
 
+// sourceManifest describes the source without hashing the block payloads a
+// second time.  The digest covers the sorted relative path and size of every
+// source file, which is sufficient to tie a run to a separately maintained
+// corpus manifest while keeping startup cheap for a multi-hundred-gigabyte
+// corpus.
+func sourceManifest(root string, paths []string) (int, int64, string, error) {
+	paths = append([]string(nil), paths...)
+	sort.Strings(paths)
+
+	hasher := sha256.New()
+	var total int64
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, 0, "", err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return 0, 0, "", err
+		}
+		total += info.Size()
+		fmt.Fprintf(hasher, "%s\t%d\n", filepath.ToSlash(rel), info.Size())
+	}
+
+	return len(paths), total, fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+// buildRevision returns the revision embedded by the Go tool.  A dirty suffix
+// prevents an uncommitted binary from being mistaken for the named commit.
+func buildRevision() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+
+	revision := "unknown"
+	modified := false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if modified {
+		revision += "-dirty"
+	}
+
+	return revision
+}
+
+func writeReplayReport(path string, report replayReport) error {
+	encoded, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+
+	return os.WriteFile(path, encoded, 0o600)
+}
+
 func run(cfg *config) error {
 	if cfg.src == "" || cfg.dst == "" {
 		return fmt.Errorf("both --src and --dst are required")
@@ -591,6 +716,16 @@ func run(cfg *config) error {
 	reader, err := newBlockFileReader(cfg.src, params.Net)
 	if err != nil {
 		return err
+	}
+	var sourceFileCount int
+	var sourceLogicalBytes int64
+	var sourceManifestSHA256 string
+	if cfg.jsonPath != "" {
+		sourceFileCount, sourceLogicalBytes, sourceManifestSHA256, err =
+			sourceManifest(cfg.src, reader.paths)
+		if err != nil {
+			return fmt.Errorf("failed to describe source corpus: %w", err)
+		}
 	}
 
 	if cfg.censusTo > 0 {
@@ -649,6 +784,7 @@ func run(cfg *config) error {
 	if err != nil {
 		return fmt.Errorf("failed to create chain: %w", err)
 	}
+	startBest := chain.BestSnapshot()
 
 	if cfg.loadOnly {
 		logf("chain state loaded to height %d in %s\n",
@@ -666,13 +802,18 @@ func run(cfg *config) error {
 		lastCheckpoint = checkpoint.Height
 	}
 	fastBelow := int32(0)
+	fastBelowHash := ""
 	if cfg.fastAdd {
 		fastBelow = lastCheckpoint
+		if checkpoint := chain.LatestCheckpoint(); checkpoint != nil {
+			fastBelowHash = checkpoint.Hash.String()
+		}
 	}
 	if cfg.fastBelow > 0 {
 		// An explicit boundary, for measuring full validation over a
 		// chosen window; it is not a consensus setting.
 		fastBelow = int32(cfg.fastBelow)
+		fastBelowHash = ""
 	}
 	logf("fast-add below height %d, full validation above\n",
 		fastBelow)
@@ -723,7 +864,12 @@ func run(cfg *config) error {
 	reportEvery := time.Duration(cfg.reportSecs) * time.Second
 
 	var processed, skipped int64
+	var processedTxns uint64
 	var lastProcessed int64
+	var lastProcessedTxns uint64
+	var fastAddBlocks, fullValidationBlocks int64
+	var fastAddTxns, fullValidationTxns uint64
+	var fastAddElapsed, fullValidationElapsed time.Duration
 
 	// The height of the last block handed to the chain.  With the
 	// pipeline the tip lags one block behind, so the tip cannot be used
@@ -780,7 +926,8 @@ func run(cfg *config) error {
 		} else {
 			_, isOrphan, err = chain.ProcessBlock(block, flags)
 		}
-		processTime += time.Since(stageStart)
+		blockProcessTime := time.Since(stageStart)
+		processTime += blockProcessTime
 		if err != nil {
 			// A block the chain already has means this run is
 			// resuming over ground the previous one covered.
@@ -802,22 +949,35 @@ func run(cfg *config) error {
 				"files are not in chain order", block.Hash())
 		}
 		processed++
+		blockTxns := uint64(len(block.Transactions()))
+		processedTxns += blockTxns
+		if flags&blockchain.BFFastAdd != 0 {
+			fastAddBlocks++
+			fastAddTxns += blockTxns
+			fastAddElapsed += blockProcessTime
+		} else {
+			fullValidationBlocks++
+			fullValidationTxns += blockTxns
+			fullValidationElapsed += blockProcessTime
+		}
 		fedHeight = nextHeight
 
 		if now := time.Now(); now.Sub(lastReport) >= reportEvery {
 			best := chain.BestSnapshot()
 			elapsed := now.Sub(lastReport).Seconds()
 			rate := float64(processed-lastProcessed) / elapsed
+			txRate := float64(processedTxns-lastProcessedTxns) / elapsed
 			meta := dirSize(metadataPath)
 
-			logf("height %7d  %7.1f blocks/s  "+
+			logf("height %7d  %7.1f blocks/s  %9.1f tx/s  "+
 				"metadata %8.2f GB  elapsed %s\n",
-				best.Height, rate,
+				best.Height, rate, txRate,
 				float64(meta)/(1<<30),
 				now.Sub(start).Truncate(time.Second))
 
 			lastReport = now
 			lastProcessed = processed
+			lastProcessedTxns = processedTxns
 		}
 
 		if cfg.maxHeight > 0 && fedHeight >= int32(cfg.maxHeight) {
@@ -833,7 +993,13 @@ func run(cfg *config) error {
 	}
 
 	best := chain.BestSnapshot()
-	elapsed := time.Since(start)
+	connectElapsed := time.Since(start)
+	transactionsReplayed := best.TotalTxns - startBest.TotalTxns
+	if fastBelow > 0 && fastBelowHash == "" && fastBelow <= best.Height {
+		if hash, err := chain.BlockHashByHeight(fastBelow); err == nil {
+			fastBelowHash = hash.String()
+		}
+	}
 
 	// Flush the UTXO cache before anything is measured.
 	//
@@ -853,10 +1019,13 @@ func run(cfg *config) error {
 	// Close before measuring.  The metadata cache holds pending writes in
 	// memory up to its size threshold, so measuring while the database is
 	// open reports a fraction of the real footprint.
+	closeStart := time.Now()
 	if err := db.Close(); err != nil {
 		return fmt.Errorf("failed to close database: %w", err)
 	}
+	closeTime := time.Since(closeStart)
 	closed = true
+	durableElapsed := time.Since(start)
 
 	meta := dirSize(metadataPath)
 	total := dirSize(cfg.dst)
@@ -864,10 +1033,16 @@ func run(cfg *config) error {
 	fmt.Printf("\n=== done ===\n")
 	logf("  height           %d\n", best.Height)
 	logf("  blocks replayed  %d (%d skipped)\n", processed, skipped)
-	logf("  elapsed          %s\n", elapsed.Truncate(time.Second))
+	logf("  connect elapsed  %s\n", connectElapsed.Truncate(time.Second))
 	logf("  utxo flush       %s\n", flushTime.Truncate(time.Second))
-	logf("  average rate     %.1f blocks/s\n",
-		float64(processed)/elapsed.Seconds())
+	logf("  database close   %s\n", closeTime.Truncate(time.Second))
+	logf("  durable elapsed  %s\n", durableElapsed.Truncate(time.Second))
+	logf("  connect rate     %.1f blocks/s  %.1f tx/s\n",
+		float64(processed)/connectElapsed.Seconds(),
+		float64(transactionsReplayed)/connectElapsed.Seconds())
+	logf("  durable rate     %.1f blocks/s  %.1f tx/s\n",
+		float64(processed)/durableElapsed.Seconds(),
+		float64(transactionsReplayed)/durableElapsed.Seconds())
 	logf("  metadata size    %.3f GB\n", float64(meta)/(1<<30))
 	if ps := pipe.Stats(); cfg.pipeline && ps.Blocks > 0 {
 		per := func(d time.Duration) string {
@@ -903,6 +1078,67 @@ func run(cfg *config) error {
 	if best.Height > 0 {
 		logf("  metadata/block   %.1f bytes\n",
 			float64(meta)/float64(best.Height))
+	}
+
+	if cfg.jsonPath != "" {
+		revision := buildRevision()
+		report := replayReport{
+			SchemaVersion: 1,
+
+			BenchmarkRevision:   revision,
+			MeasurementRevision: revision,
+
+			SourceFileCount:      sourceFileCount,
+			SourceLogicalBytes:   sourceLogicalBytes,
+			SourceManifestSHA256: sourceManifestSHA256,
+
+			StartHeight:            startBest.Height,
+			StartHash:              startBest.Hash.String(),
+			StartTotalTransactions: startBest.TotalTxns,
+			FinalHeight:            best.Height,
+			FinalHash:              best.Hash.String(),
+			FinalTotalTransactions: best.TotalTxns,
+
+			BlocksReplayed:       processed,
+			TransactionsReplayed: transactionsReplayed,
+			BlocksSkipped:        skipped,
+
+			FastAddCheckpointHeight:      fastBelow,
+			FastAddCheckpointHash:        fastBelowHash,
+			FastAddBlocks:                fastAddBlocks,
+			FastAddTransactions:          fastAddTxns,
+			FastAddElapsedSeconds:        fastAddElapsed.Seconds(),
+			FullValidationBlocks:         fullValidationBlocks,
+			FullValidationTransactions:   fullValidationTxns,
+			FullValidationElapsedSeconds: fullValidationElapsed.Seconds(),
+
+			ConnectElapsedSeconds: connectElapsed.Seconds(),
+			FlushElapsedSeconds:   flushTime.Seconds(),
+			CloseElapsedSeconds:   closeTime.Seconds(),
+			DurableElapsedSeconds: durableElapsed.Seconds(),
+			ProcessWallSeconds:    time.Since(start).Seconds(),
+
+			AverageConnectTPS:      float64(transactionsReplayed) / connectElapsed.Seconds(),
+			AverageDurableTPS:      float64(transactionsReplayed) / durableElapsed.Seconds(),
+			AverageBlocksPerSecond: float64(processed) / durableElapsed.Seconds(),
+
+			UtxoCacheMiB: cfg.utxoCache,
+			ParseWorkers: cfg.workers,
+			UtxoWorkers:  cfg.utxoWorkers,
+			Depth:        cfg.depth,
+			GOGC:         cfg.gogc,
+			MemLimitGiB:  cfg.memLimitGB,
+			SigCache:     cfg.sigCache,
+
+			MetadataBytes:      meta,
+			TotalDatabaseBytes: total,
+			PeakRSSBytes:       peakRSSBytes(),
+			ExitCode:           0,
+		}
+		if err := writeReplayReport(cfg.jsonPath, report); err != nil {
+			return fmt.Errorf("failed to write replay report: %w", err)
+		}
+		logf("  json report      %s\n", cfg.jsonPath)
 	}
 
 	return nil
