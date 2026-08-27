@@ -5,9 +5,10 @@
 ###########################
 # Build binaries stage
 ###########################
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+FROM golang:1.27.0-alpine AS build
 ADD . /app
 WORKDIR /app
+RUN apk add --no-cache build-base
 # Arguments required to build binaries targetting the correct OS and CPU architectures
 ARG TARGETOS TARGETARCH
 # Actually building the binaries
@@ -16,7 +17,7 @@ RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go install -v . ./cmd/...
 ###########################
 # Build docker image stage
 ###########################
-FROM alpine:3.15
+FROM alpine:3.24
 COPY --from=build /go/bin /bin
 # 8333  Mainnet Bitcoin peer-to-peer port
 # 8334  Mainet RPC port
