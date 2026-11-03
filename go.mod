@@ -1,6 +1,6 @@
 module github.com/btcsuite/btcd
 
-go 1.27.0
+go 1.27.3
 
 require (
 	github.com/btcsuite/btcd/address/v2 v2.0.0
